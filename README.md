@@ -78,6 +78,18 @@ wrangler deploy
 
 部署成功后会得到一个 URL，类似：`https://claude-api-router.your-subdomain.workers.dev`
 
+### 6. 绑定自定义域名（推荐）
+
+**⚠️ 重要**: `workers.dev` 域名在中国大陆无法访问，强烈建议绑定自定义域名。
+
+1. 在 Cloudflare Dashboard 中打开你的 Worker
+2. 进入 **Triggers** 标签页
+3. 点击 **Add Custom Domain**
+4. 输入你的域名（如 `api.yourdomain.com`）
+5. Cloudflare 会自动配置 DNS 和 SSL 证书
+
+绑定后使用自定义域名：`https://api.yourdomain.com`
+
 ## 使用方法
 
 将所有 Claude API 请求发送到你的 Worker URL：
