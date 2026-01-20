@@ -15,15 +15,20 @@
 ## 快速开始（Claude Code 用户）
 
 1. 部署 Worker（见下方部署步骤）
-2. 获取你的 Worker URL：`https://your-worker.workers.dev`
-3. 配置 Claude Code：
+2. 获取你的 Worker URL：`https://your-worker.workers.dev`（建议绑定自定义域名）
+3. 配置 Claude Code，编辑 `~/.claude/settings.json`：
 
-```bash
-# CLI 配置
-claude config set apiUrl https://your-worker.workers.dev
-
-# 或设置环境变量
-export ANTHROPIC_BASE_URL=https://your-worker.workers.dev
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "替换为您的API Key",
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev"
+  },
+  "permissions": {
+    "allow": [],
+    "deny": []
+  }
+}
 ```
 
 4. 开始使用！Worker 会自动选择最便宜的可用端点

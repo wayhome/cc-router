@@ -10,20 +10,25 @@
 
 #### CLI 配置
 
-编辑 `~/.config/claude-code/config.json`:
+编辑 `~/.claude/settings.json`:
 
 ```json
 {
-  "apiKey": "your-api-key",
-  "apiUrl": "https://your-worker.workers.dev"
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "替换为您的API Key",
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev"
+  },
+  "permissions": {
+    "allow": [],
+    "deny": []
+  }
 }
 ```
 
-或使用命令行设置：
-
-```bash
-claude config set apiUrl https://your-worker.workers.dev
-```
+注意：
+- 使用 `ANTHROPIC_AUTH_TOKEN` 而不是 `apiKey`
+- 使用 `ANTHROPIC_BASE_URL` 而不是 `apiUrl`
+- 配置文件位置是 `~/.claude/settings.json`
 
 #### VSCode 扩展配置
 
