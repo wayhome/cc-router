@@ -110,10 +110,10 @@ wrangler tail
 
 ```bash
 # 列出所有健康状态
-wrangler kv:key list --namespace-id=your-namespace-id
+wrangler kv key list --namespace-id=your-namespace-id
 
 # 查看特定端点的状态
-wrangler kv:key get "endpoint_health_0" --namespace-id=your-namespace-id
+wrangler kv key get endpoint_health_0 --namespace-id=your-namespace-id
 ```
 
 ## 高级配置
@@ -153,10 +153,11 @@ A: 如果便宜的端点连续失败 3 次，会进入 1 分钟冷却期，期�
 A: 可以手动清空 KV 存储：
 
 ```bash
-wrangler kv:key delete "endpoint_health_0" --namespace-id=your-namespace-id
-wrangler kv:key delete "endpoint_health_1" --namespace-id=your-namespace-id
-wrangler kv:key delete "endpoint_health_2" --namespace-id=your-namespace-id
-wrangler kv:key delete "endpoint_health_3" --namespace-id=your-namespace-id
+# 获取 KV namespace ID（从 wrangler.toml 中查看）
+wrangler kv key delete endpoint_health_0 --namespace-id=your-namespace-id
+wrangler kv key delete endpoint_health_1 --namespace-id=your-namespace-id
+wrangler kv key delete endpoint_health_2 --namespace-id=your-namespace-id
+wrangler kv key delete endpoint_health_3 --namespace-id=your-namespace-id
 ```
 
 或等待 2 分钟自动过期。

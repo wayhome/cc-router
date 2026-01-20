@@ -47,7 +47,7 @@ wrangler login
 ### 3. 创建 KV 命名空间
 
 ```bash
-wrangler kv:namespace create "ENDPOINT_HEALTH"
+wrangler kv namespace create ENDPOINT_HEALTH
 ```
 
 这会输出类似以下内容：
