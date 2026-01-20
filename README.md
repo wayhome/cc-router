@@ -8,9 +8,10 @@
 
 - **价格优先**: 按价格从低到高尝试端点（aws < droid < ultra < claude）
 - **智能故障转移**: 遇到 4xx/5xx 错误自动切换到下一个端点
-- **全局状态管理**: 使用 Cloudflare KV 在不同实例和地区之间共享端点健康状态
+- **内存状态管理**: 使用全局内存缓存记录端点健康状态（同一实例内共享）
 - **自动冷却**: 连续失败 3 次的端点会被标记为不可用 1 分钟
 - **自动恢复**: 冷却期结束后端点自动恢复可用
+- **零成本**: 完全免费运行
 
 ## 快速开始（Claude Code 用户）
 
@@ -49,33 +50,7 @@ npm install -g wrangler
 wrangler login
 ```
 
-### 3. 创建 KV 命名空间
-
-```bash
-wrangler kv namespace create ENDPOINT_HEALTH
-```
-
-这会输出类似以下内容：
-```
-🌀 Creating namespace with title "claude-api-router-ENDPOINT_HEALTH"
-✨ Success!
-Add the following to your wrangler.toml:
-[[kv_namespaces]]
-binding = "ENDPOINT_HEALTH"
-id = "abc123def456..."
-```
-
-### 4. 更新 wrangler.toml
-
-将上一步输出的 `id` 复制到 [wrangler.toml](wrangler.toml) 中：
-
-```toml
-[[kv_namespaces]]
-binding = "ENDPOINT_HEALTH"
-id = "abc123def456..."  # 替换为你的 KV namespace ID
-```
-
-### 5. 部署 Worker
+### 3. 部署 Worker
 
 ```bash
 wrangler deploy
@@ -83,7 +58,7 @@ wrangler deploy
 
 部署成功后会得到一个 URL，类似：`https://claude-api-router.your-subdomain.workers.dev`
 
-### 6. 绑定自定义域名（推荐）
+### 4. 绑定自定义域名（推荐）
 
 **⚠️ 重要**: `workers.dev` 域名在中国大陆无法访问，强烈建议绑定自定义域名。
 
@@ -132,23 +107,22 @@ wrangler tail
 
 ## 配置调整
 
-修改 [worker.js:22-29](worker.js#L22-L29) 中的配置：
+修改 [worker.js:24-32](worker.js#L24-L32) 中的配置：
 
 ```javascript
 const HEALTH_CHECK_CONFIG = {
   COOLDOWN_TIME: 60,     // 冷却时间（秒），默认 1 分钟
   MAX_FAILURES: 3,       // 触发冷却的连续失败次数
-  KV_PREFIX: 'endpoint_health_'  // KV key 前缀
 };
 ```
 
-## KV 存储说明
+## 状态管理说明
 
-- **免费额度**: 每天 100,000 次读取 + 1,000 次写入
-- **延迟**: 最终一致性，全局同步约 60 秒
-- **自动过期**: 健康状态会在 2 分钟后自动过期（冷却时间的 2 倍）
-
-对于大多数场景，免费额度足够使用。如果没有绑定 KV，Worker 仍然可以工作，但不会跨实例共享状态。
+- **存储方式**: 使用全局内存缓存（Map）存储端点健康状态
+- **共享范围**: 同一 Worker 实例内的所有请求共享状态
+- **成本**: 完全免费，无任何限制
+- **性能**: 内存访问，零延迟
+- **持久性**: Worker 重启后状态重置，会自动重新学习端点健康状况
 
 ## 架构说明
 
@@ -157,7 +131,7 @@ const HEALTH_CHECK_CONFIG = {
   ↓
 Cloudflare Worker
   ↓
-检查 KV 中的端点健康状态
+检查内存缓存中的端点健康状态
   ↓
 按价格顺序尝试可用端点:
   1. /claude/aws (最便宜)
@@ -165,7 +139,7 @@ Cloudflare Worker
   3. /claude/ultra
   4. /claude (最贵)
   ↓
-记录成功/失败到 KV
+记录成功/失败到内存缓存
   ↓
 返回响应
 ```

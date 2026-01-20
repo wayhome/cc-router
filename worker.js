@@ -3,7 +3,7 @@
  *
  * 智能路由，在多个 Claude API 端点之间自动切换
  * - 按价格从低到高排序（aws < droid < ultra < claude）
- * - 使用 KV 存储记录端点健康状态（跨实例共享）
+ * - 使用全局内存缓存记录端点健康状态（同一实例内共享）
  * - 自动故障转移，优先使用最便宜的可用端点
  * - 失败的端点会被临时标记，一段时间后重新尝试
  */
@@ -18,61 +18,44 @@ const ENDPOINTS = [
   '/claude'           // 最贵
 ];
 
+// 全局健康状态缓存（跨请求共享，同一 Worker 实例内所有请求共享）
+const globalHealthCache = new Map();
+
 // 端点健康检查配置
 const HEALTH_CHECK_CONFIG = {
   // 失败后的冷却时间（秒）
   COOLDOWN_TIME: 60,  // 1分钟
   // 连续失败多少次后进入冷却
-  MAX_FAILURES: 3,
-  // KV 存储的 key 前缀
-  KV_PREFIX: 'endpoint_health_'
+  MAX_FAILURES: 3
 };
 
 /**
  * 端点健康状态管理类
- * 使用 KV 存储在不同实例和地区之间共享状态
+ * 使用全局内存缓存存储健康状态（同一 Worker 实例内共享）
  */
 class EndpointHealthManager {
-  constructor(kv) {
-    this.kv = kv;
-  }
-
-  /**
-   * 获取端点的 KV key
-   */
-  getKey(index) {
-    return `${HEALTH_CHECK_CONFIG.KV_PREFIX}${index}`;
+  constructor() {
+    // 不再需要构造参数，直接使用全局缓存
   }
 
   /**
    * 获取端点健康状态
    */
   async getHealth(index) {
-    if (!this.kv) {
+    const health = globalHealthCache.get(index);
+
+    if (!health) {
       return { failures: 0, lastFailTime: 0, inCooldown: false };
     }
 
-    const key = this.getKey(index);
-    const data = await this.kv.get(key, 'json');
-
-    if (!data) {
-      return { failures: 0, lastFailTime: 0, inCooldown: false };
-    }
-
-    return data;
+    return health;
   }
 
   /**
    * 保存端点健康状态
    */
   async saveHealth(index, health) {
-    if (!this.kv) return;
-
-    const key = this.getKey(index);
-    // 设置过期时间为冷却时间的 2 倍，确保过期后自动清理
-    await this.kv.put(key, JSON.stringify(health), {
-      expirationTtl: HEALTH_CHECK_CONFIG.COOLDOWN_TIME * 2
-    });
+    globalHealthCache.set(index, health);
   }
 
   /**
@@ -85,7 +68,7 @@ class EndpointHealthManager {
     // 如果在冷却期，检查是否已过冷却时间
     if (health.inCooldown) {
       if (now - health.lastFailTime >= HEALTH_CHECK_CONFIG.COOLDOWN_TIME * 1000) {
-        // 冷却期结束，允许使用（不立即写入 KV，等成功时再重置）
+        // 冷却期结束，允许使用（等成功时再重置状态）
         return true;
       }
       return false;
@@ -125,7 +108,7 @@ class EndpointHealthManager {
         inCooldown: false
       });
     }
-    // 如果端点一直健康，不需要写入 KV
+    // 如果端点一直健康，不需要写入缓存
   }
 }
 
@@ -227,8 +210,8 @@ export default {
       });
     }
 
-    // 创建健康管理器（传入 KV 命名空间）
-    const manager = new EndpointHealthManager(env.ENDPOINT_HEALTH);
+    // 创建健康管理器
+    const manager = new EndpointHealthManager();
 
     // 尝试所有端点（按价格从低到高）
     const result = await tryEndpoints(request, manager);

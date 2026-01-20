@@ -111,15 +111,13 @@ wrangler tail
 
 ### 查看端点健康状态
 
-使用 Wrangler 查看 KV 存储：
+端点健康状态存储在 Worker 实例的内存中，可以通过日志观察：
 
 ```bash
-# 列出所有健康状态
-wrangler kv key list --namespace-id=your-namespace-id
-
-# 查看特定端点的状态
-wrangler kv key get endpoint_health_0 --namespace-id=your-namespace-id
+wrangler tail
 ```
+
+日志会显示端点进入/退出冷却期的信息。
 
 ## 高级配置
 
@@ -155,21 +153,7 @@ A: 如果便宜的端点连续失败 3 次，会进入 1 分钟冷却期，期�
 
 ### Q: 如何重置端点状态？
 
-A: 可以手动清空 KV 存储：
-
-```bash
-# 获取 KV namespace ID（从 wrangler.toml 中查看）
-wrangler kv key delete endpoint_health_0 --namespace-id=your-namespace-id
-wrangler kv key delete endpoint_health_1 --namespace-id=your-namespace-id
-wrangler kv key delete endpoint_health_2 --namespace-id=your-namespace-id
-wrangler kv key delete endpoint_health_3 --namespace-id=your-namespace-id
-```
-
-或等待 2 分钟自动过期。
-
-### Q: 如果不配置 KV 会怎样？
-
-A: Worker 仍然可以正常工作，但健康状态不会在不同实例间共享，每个 Worker 实例会独立管理状态。
+A: 重新部署 Worker 或等待 Worker 实例重启即可重置状态。健康状态存储在内存中，会在重启后自动清空。
 
 ### Q: 支持流式响应吗？
 
@@ -200,11 +184,9 @@ if (url.pathname === '/v1/models') {
 
 Cloudflare Workers 免费额度：
 - 100,000 次请求/天
-- KV: 100,000 次读取 + 1,000 次写入/天
 
 对于个人使用，免费额度通常足够。如果超出：
 - Workers: $5/月，包含 1000 万次请求
-- KV: $0.50/GB 存储 + 按使用付费
 
 ## 安全建议
 
