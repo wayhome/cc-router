@@ -2,6 +2,8 @@
 
 智能 Claude API 路由器，在多个 API 端点之间自动切换，优先使用最便宜且可用的端点。
 
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/your-username/cc-router)
+
 **📘 [Claude Code 配置指南](CLAUDE_CODE_SETUP.md)** - 查看如何在 Claude Code CLI 和 VSCode 扩展中使用
 
 ## 功能特性
