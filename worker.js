@@ -85,12 +85,7 @@ class EndpointHealthManager {
     // 如果在冷却期，检查是否已过冷却时间
     if (health.inCooldown) {
       if (now - health.lastFailTime >= HEALTH_CHECK_CONFIG.COOLDOWN_TIME * 1000) {
-        // 冷却期结束，重置状态
-        await this.saveHealth(index, {
-          failures: 0,
-          lastFailTime: 0,
-          inCooldown: false
-        });
+        // 冷却期结束，允许使用（不立即写入 KV，等成功时再重置）
         return true;
       }
       return false;
@@ -120,11 +115,17 @@ class EndpointHealthManager {
    * 记录端点成功
    */
   async recordSuccess(index) {
-    await this.saveHealth(index, {
-      failures: 0,
-      lastFailTime: 0,
-      inCooldown: false
-    });
+    const health = await this.getHealth(index);
+
+    // 只有在端点之前有失败记录或在冷却期时才需要重置
+    if (health.failures > 0 || health.inCooldown) {
+      await this.saveHealth(index, {
+        failures: 0,
+        lastFailTime: 0,
+        inCooldown: false
+      });
+    }
+    // 如果端点一直健康，不需要写入 KV
   }
 }
 
