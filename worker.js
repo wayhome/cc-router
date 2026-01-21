@@ -15,6 +15,7 @@ const ENDPOINTS = [
   '/claude/aws',      // 最便宜
   '/claude/droid',
   '/claude/ultra',
+  '/claude/super',    // 次贵
   '/claude'           // 最贵
 ];
 
