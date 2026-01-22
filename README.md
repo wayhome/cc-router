@@ -12,6 +12,7 @@
 
 - **价格优先**: 按价格从低到高尝试端点（droid < aws < ultra < super < claude）
 - **指定端点路由**: 支持通过路径指定优先使用的端点（如 `/claude/aws/v1/messages`）
+- **OpenAI 兼容接口**: 支持 OpenAI Chat Completions API 格式，自动转换为 Claude API
 - **智能故障转移**: 遇到 4xx/5xx 错误自动切换到下一个端点
 - **内存状态管理**: 使用全局内存缓存记录端点健康状态（同一实例内共享）
 - **自动冷却**: 连续失败 3 次的端点会被标记为不可用 1 分钟
@@ -142,12 +143,120 @@ curl https://your-worker.workers.dev/claude/super/v1/messages \
 - `/claude/v1/messages` - 优先使用 claude 端点
 - `/v1/messages` - 自动路由（默认行为）
 
+### 方式 3: OpenAI 兼容接口（新功能）
+
+使用 OpenAI Chat Completions API 格式调用 Claude API，Worker 会自动进行格式转换：
+
+```bash
+curl https://your-worker.workers.dev/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-3-5-sonnet-20241022",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "Hello!"}
+    ],
+    "max_tokens": 1024,
+    "temperature": 0.7
+  }'
+```
+
+**OpenAI 接口支持的功能**：
+- ✅ 自动将 OpenAI 请求格式转换为 Claude Messages API 格式
+- ✅ 自动将 Claude 响应格式转换为 OpenAI Chat Completions 格式
+- ✅ 支持 `system`、`user`、`assistant` 角色
+- ✅ 支持 `temperature`、`top_p`、`max_tokens`、`stop` 等参数
+- ✅ 支持流式响应（`stream: true`）
+- ✅ 支持 `/v1/models` 接口获取可用模型列表
+- ✅ 完整的端点路由和故障转移支持
+
+**指定端点的 OpenAI 格式调用**：
+```bash
+# 优先使用 aws 端点的 OpenAI 格式调用
+curl https://your-worker.workers.dev/claude/aws/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+```
+
+**获取可用模型列表**：
+```bash
+curl https://your-worker.workers.dev/v1/models \
+  -H "Authorization: Bearer your-api-key"
+```
+
+响应示例：
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "claude-sonnet-4-5-20250929",
+      "object": "model",
+      "created": 1677652288,
+      "owned_by": "anthropic"
+    },
+    {
+      "id": "claude-haiku-4-5-20251001",
+      "object": "model",
+      "created": 1677652288,
+      "owned_by": "anthropic"
+    },
+    {
+      "id": "claude-opus-4-5-20251101",
+      "object": "model",
+      "created": 1677652288,
+      "owned_by": "anthropic"
+    }
+  ]
+}
+```
+
+**响应格式对比**：
+
+OpenAI 格式响应：
+```json
+{
+  "id": "chatcmpl-123",
+  "object": "chat.completion",
+  "created": 1677652288,
+  "model": "claude-3-5-sonnet-20241022",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "Hello! How can I assist you today?"
+    },
+    "finish_reason": "stop"
+  }],
+  "usage": {
+    "prompt_tokens": 20,
+    "completion_tokens": 10,
+    "total_tokens": 30
+  }
+}
+```
+
+Claude 原生格式响应（使用 `/v1/messages`）：
+```json
+{
+  "id": "msg_123",
+  "type": "message",
+  "role": "assistant",
+  "content": [{"type": "text", "text": "Hello! How can I assist you today?"}],
+  "stop_reason": "end_turn",
+  "usage": {"input_tokens": 20, "output_tokens": 10}
+}
+```
+
 ## 调试
 
 响应头中包含调试信息：
 - `X-Used-Endpoint`: 实际使用的端点路径
 - `X-Endpoint-Index`: 端点索引（0=droid, 1=aws, 2=ultra, 3=super, 4=claude）
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
+- `X-Format-Conversion`: 如果使用了 OpenAI 格式转换，显示 "OpenAI"
 
 查看日志：
 ```bash

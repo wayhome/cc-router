@@ -7,6 +7,7 @@
  * - 自动故障转移，优先使用最便宜的可用端点
  * - 失败的端点会被临时标记，一段时间后重新尝试
  * - 支持指定端点路由，优先使用对应的实际端点
+ * - 支持 OpenAI Completions API 格式兼容
  */
 
 const TARGET_BASE_URL = 'https://code.newcli.com';
@@ -115,23 +116,335 @@ class EndpointHealthManager {
 }
 
 /**
+ * 检查值是否有效（不是 undefined、null 或字符串 "[undefined]"）
+ */
+function isValidValue(value) {
+  if (value === undefined || value === null || value === '[undefined]' || value === 'undefined') {
+    return false;
+  }
+  // 如果是对象或数组，检查是否为空或只包含无效值
+  if (typeof value === 'object') {
+    if (Array.isArray(value)) {
+      return value.length > 0;
+    }
+    // 对于普通对象，检查是否有有效的属性
+    return Object.keys(value).length > 0;
+  }
+  return true;
+}
+
+/**
+ * 清理对象中的无效值
+ */
+function cleanObject(obj) {
+  if (!obj || typeof obj !== 'object') {
+    return obj;
+  }
+
+  const cleaned = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (isValidValue(value)) {
+      cleaned[key] = value;
+    }
+  }
+  return cleaned;
+}
+
+/**
+ * 转换 OpenAI Chat Completions 请求格式为 Claude Messages API 格式
+ */
+function convertOpenAIToClaude(openaiRequest) {
+  const claudeRequest = {
+    model: isValidValue(openaiRequest.model) ? openaiRequest.model : 'claude-3-5-sonnet-20241022',
+    max_tokens: isValidValue(openaiRequest.max_tokens) ? openaiRequest.max_tokens : 4096,
+    messages: []
+  };
+
+  // 转换消息格式
+  if (openaiRequest.messages && Array.isArray(openaiRequest.messages)) {
+    for (const msg of openaiRequest.messages) {
+      if (msg.role === 'system') {
+        // Claude 的 system 消息单独处理
+        if (isValidValue(msg.content)) {
+          claudeRequest.system = msg.content;
+        }
+      } else if (msg.role === 'user' || msg.role === 'assistant') {
+        if (isValidValue(msg.content)) {
+          claudeRequest.messages.push({
+            role: msg.role,
+            content: msg.content
+          });
+        }
+      }
+    }
+  }
+
+  // 可选参数转换 - 只添加有效的参数
+  if (isValidValue(openaiRequest.temperature) && typeof openaiRequest.temperature === 'number') {
+    claudeRequest.temperature = openaiRequest.temperature;
+  }
+  if (isValidValue(openaiRequest.top_p) && typeof openaiRequest.top_p === 'number') {
+    claudeRequest.top_p = openaiRequest.top_p;
+  }
+  if (isValidValue(openaiRequest.stream) && typeof openaiRequest.stream === 'boolean') {
+    claudeRequest.stream = openaiRequest.stream;
+  }
+  if (isValidValue(openaiRequest.stop)) {
+    if (Array.isArray(openaiRequest.stop)) {
+      claudeRequest.stop_sequences = openaiRequest.stop.filter(s => isValidValue(s));
+    } else if (typeof openaiRequest.stop === 'string') {
+      claudeRequest.stop_sequences = [openaiRequest.stop];
+    }
+  }
+
+  return claudeRequest;
+}
+
+/**
+ * 转换 Claude SSE 流为 OpenAI SSE 流
+ */
+async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
+  const reader = claudeStream.getReader();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+
+  return new ReadableStream({
+    async start(controller) {
+      let buffer = '';
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+
+          if (done) {
+            controller.close();
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (!line.trim() || line.startsWith(':')) continue;
+
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+
+              if (data === '[DONE]') {
+                controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                continue;
+              }
+
+              try {
+                const claudeEvent = JSON.parse(data);
+                let openaiEvent = null;
+
+                // 转换不同类型的 Claude 事件为 OpenAI 格式
+                switch (claudeEvent.type) {
+                  case 'message_start':
+                    openaiEvent = {
+                      id: claudeEvent.message.id || `chatcmpl-${Date.now()}`,
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model: originalModel || claudeEvent.message.model || 'claude-3-5-sonnet-20241022',
+                      choices: [{
+                        index: 0,
+                        delta: { role: 'assistant', content: '' },
+                        finish_reason: null
+                      }]
+                    };
+                    break;
+
+                  case 'content_block_start':
+                    // OpenAI 在第一个 chunk 中已经包含了 role，这里跳过
+                    continue;
+
+                  case 'content_block_delta':
+                    if (claudeEvent.delta?.type === 'text_delta') {
+                      openaiEvent = {
+                        id: `chatcmpl-${Date.now()}`,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: originalModel || 'claude-3-5-sonnet-20241022',
+                        choices: [{
+                          index: 0,
+                          delta: { content: claudeEvent.delta.text },
+                          finish_reason: null
+                        }]
+                      };
+                    }
+                    break;
+
+                  case 'content_block_stop':
+                    // 内容块结束，不需要发送事件
+                    continue;
+
+                  case 'message_delta':
+                    // 处理 stop_reason
+                    if (claudeEvent.delta?.stop_reason) {
+                      const finishReason = claudeEvent.delta.stop_reason === 'end_turn' ? 'stop' :
+                                         claudeEvent.delta.stop_reason === 'max_tokens' ? 'length' :
+                                         claudeEvent.delta.stop_reason;
+                      openaiEvent = {
+                        id: `chatcmpl-${Date.now()}`,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: originalModel || 'claude-3-5-sonnet-20241022',
+                        choices: [{
+                          index: 0,
+                          delta: {},
+                          finish_reason: finishReason
+                        }]
+                      };
+                    }
+                    break;
+
+                  case 'message_stop':
+                    // 消息结束，发送 [DONE]
+                    controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                    continue;
+
+                  case 'ping':
+                    // 心跳事件，跳过
+                    continue;
+
+                  case 'error':
+                    // 错误事件
+                    openaiEvent = {
+                      error: {
+                        message: claudeEvent.error?.message || 'Unknown error',
+                        type: claudeEvent.error?.type || 'api_error'
+                      }
+                    };
+                    break;
+
+                  default:
+                    console.log('Unknown Claude event type:', claudeEvent.type);
+                    continue;
+                }
+
+                if (openaiEvent) {
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(openaiEvent)}\n\n`));
+                }
+              } catch (e) {
+                console.error('Error parsing SSE data:', e, data);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Stream conversion error:', error);
+        controller.error(error);
+      }
+    }
+  });
+}
+
+/**
+ * 转换 Claude Messages API 响应格式为 OpenAI Chat Completions 格式
+ */
+function convertClaudeToOpenAI(claudeResponse, model) {
+  // 如果是流式响应，直接返回原始响应
+  if (claudeResponse.headers.get('content-type')?.includes('text/event-stream')) {
+    return claudeResponse;
+  }
+
+  return {
+    id: claudeResponse.id || `chatcmpl-${Date.now()}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: model || 'claude-3-5-sonnet-20241022',
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: claudeResponse.content?.[0]?.text || ''
+        },
+        finish_reason: claudeResponse.stop_reason === 'end_turn' ? 'stop' :
+                      claudeResponse.stop_reason === 'max_tokens' ? 'length' :
+                      claudeResponse.stop_reason || 'stop'
+      }
+    ],
+    usage: {
+      prompt_tokens: claudeResponse.usage?.input_tokens || 0,
+      completion_tokens: claudeResponse.usage?.output_tokens || 0,
+      total_tokens: (claudeResponse.usage?.input_tokens || 0) + (claudeResponse.usage?.output_tokens || 0)
+    }
+  };
+}
+
+/**
+ * 生成 OpenAI 模型列表响应
+ */
+function getOpenAIModelsResponse() {
+  const models = [
+    'claude-sonnet-4-5-20250929',
+    'claude-haiku-4-5-20251001',
+    'claude-opus-4-5-20251101'
+  ];
+
+  return {
+    object: 'list',
+    data: models.map(id => ({
+      id,
+      object: 'model',
+      created: Math.floor(Date.now() / 1000),
+      owned_by: 'anthropic'
+    }))
+  };
+}
+
+/**
  * 解析请求路径，提取端点信息
- * 返回 { preferredEndpoint: string|null, apiPath: string }
+ * 返回 { preferredEndpoint: string|null, apiPath: string, isOpenAI: boolean, isModels: boolean }
  */
 function parseRequestPath(url) {
   const pathname = new URL(url).pathname;
+
+  // 检查是否是 OpenAI Models 路径
+  if (pathname === '/v1/models' || pathname.endsWith('/v1/models')) {
+    return {
+      preferredEndpoint: null,
+      apiPath: '/v1/models',
+      isOpenAI: true,
+      isModels: true
+    };
+  }
+
+  // 检查是否是 OpenAI Chat Completions 路径
+  if (pathname === '/v1/chat/completions' || pathname.endsWith('/v1/chat/completions')) {
+    // 检查是否指定了端点
+    for (const endpoint of ENDPOINTS) {
+      if (pathname.startsWith(endpoint + '/')) {
+        return {
+          preferredEndpoint: endpoint,
+          apiPath: '/v1/messages',
+          isOpenAI: true,
+          isModels: false
+        };
+      }
+    }
+    return {
+      preferredEndpoint: null,
+      apiPath: '/v1/messages',
+      isOpenAI: true,
+      isModels: false
+    };
+  }
 
   // 检查是否匹配端点路径
   for (const endpoint of ENDPOINTS) {
     if (pathname.startsWith(endpoint + '/') || pathname === endpoint) {
       // 提取端点后的 API 路径
       const apiPath = pathname.slice(endpoint.length) || '/';
-      return { preferredEndpoint: endpoint, apiPath };
+      return { preferredEndpoint: endpoint, apiPath, isOpenAI: false, isModels: false };
     }
   }
 
   // 没有匹配到特定端点，使用默认路由
-  return { preferredEndpoint: null, apiPath: pathname };
+  return { preferredEndpoint: null, apiPath: pathname, isOpenAI: false, isModels: false };
 }
 
 /**
@@ -248,57 +561,163 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
 
 export default {
   async fetch(request, env, ctx) {
-    // 处理 OPTIONS 预检请求
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': '*',
-          'Access-Control-Max-Age': '86400'
+    try {
+      // 处理 OPTIONS 预检请求
+      if (request.method === 'OPTIONS') {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': '*',
+            'Access-Control-Max-Age': '86400'
+          }
+        });
+      }
+
+      // 解析请求路径，提取优先端点、API 路径和是否为 OpenAI 格式
+      const { preferredEndpoint, apiPath, isOpenAI, isModels } = parseRequestPath(request.url);
+
+      // 如果是 OpenAI models 接口，直接返回模型列表
+      if (isModels) {
+        return new Response(JSON.stringify(getOpenAIModelsResponse()), {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+
+      // 如果是 OpenAI 格式，需要转换请求体
+      let processedRequest = request;
+      let originalModel = null;
+
+      if (isOpenAI && request.method === 'POST') {
+        try {
+          const openaiBody = await request.json();
+          console.log('Received OpenAI request:', JSON.stringify(openaiBody));
+
+          originalModel = openaiBody.model;
+          const claudeBody = convertOpenAIToClaude(openaiBody);
+
+          console.log('Converted to Claude format:', JSON.stringify(claudeBody));
+
+          // 创建新的请求对象，使用转换后的 Claude 格式
+          processedRequest = new Request(request.url, {
+            method: request.method,
+            headers: request.headers,
+            body: JSON.stringify(claudeBody)
+          });
+        } catch (error) {
+          console.error('Error converting OpenAI request:', error.message, error.stack);
+          return new Response(JSON.stringify({
+            error: {
+              message: `Invalid request body: ${error.message}`,
+              type: 'invalid_request_error'
+            }
+          }), {
+            status: 400,
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*'
+            }
+          });
         }
+      }
+
+      // 创建健康管理器
+      const manager = new EndpointHealthManager();
+
+      // 尝试所有端点（如果指定了优先端点，先尝试它）
+      const result = await tryEndpoints(processedRequest, manager, apiPath, preferredEndpoint);
+
+      if (!result.success) {
+        const errorBody = isOpenAI
+          ? JSON.stringify({
+              error: {
+                message: 'All endpoints failed',
+                type: 'api_error'
+              }
+            })
+          : 'All endpoints failed';
+
+        return new Response(errorBody, {
+          status: 503,
+          headers: {
+            'Content-Type': isOpenAI ? 'application/json' : 'text/plain',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+
+      // 如果是 OpenAI 格式，需要转换响应
+      let responseBody = result.response.body;
+      let responseStatus = result.response.status;
+      let contentType = result.response.headers.get('content-type');
+
+      // 处理流式响应和非流式响应
+      if (isOpenAI && responseStatus === 200) {
+        if (contentType?.includes('text/event-stream')) {
+          // 流式响应：转换 Claude SSE 为 OpenAI SSE
+          try {
+            responseBody = await convertClaudeStreamToOpenAI(result.response.body, originalModel);
+          } catch (error) {
+            console.error('Failed to convert Claude stream to OpenAI format:', error);
+            // 如果转换失败，返回原始流
+          }
+        } else {
+          // 非流式响应：转换 JSON 格式
+          try {
+            const claudeResponse = await result.response.json();
+            const openaiResponse = convertClaudeToOpenAI(claudeResponse, originalModel);
+            responseBody = JSON.stringify(openaiResponse);
+          } catch (error) {
+            console.error('Failed to convert Claude response to OpenAI format:', error);
+            // 如果转换失败，返回原始响应
+          }
+        }
+      }
+
+      // 构建响应头
+      const responseHeaders = new Headers(result.response.headers);
+
+      // 添加 CORS 头
+      responseHeaders.set('Access-Control-Allow-Origin', '*');
+      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      responseHeaders.set('Access-Control-Allow-Headers', '*');
+
+      // 添加调试信息头
+      responseHeaders.set('X-Used-Endpoint', ENDPOINTS[result.endpointIndex]);
+      responseHeaders.set('X-Endpoint-Index', result.endpointIndex.toString());
+      if (preferredEndpoint) {
+        responseHeaders.set('X-Preferred-Endpoint', preferredEndpoint);
+      }
+      if (isOpenAI) {
+        responseHeaders.set('X-Format-Conversion', 'OpenAI');
+      }
+
+      return new Response(responseBody, {
+        status: responseStatus,
+        statusText: result.response.statusText,
+        headers: responseHeaders
       });
-    }
+    } catch (error) {
+      // 全局错误捕获
+      console.error('Unexpected error in worker:', error.message, error.stack);
 
-    // 解析请求路径，提取优先端点和 API 路径
-    const { preferredEndpoint, apiPath } = parseRequestPath(request.url);
-
-    // 创建健康管理器
-    const manager = new EndpointHealthManager();
-
-    // 尝试所有端点（如果指定了优先端点，先尝试它）
-    const result = await tryEndpoints(request, manager, apiPath, preferredEndpoint);
-
-    if (!result.success) {
-      return new Response('All endpoints failed', {
-        status: 503,
+      return new Response(JSON.stringify({
+        error: {
+          message: `Internal server error: ${error.message}`,
+          type: 'internal_error'
+        }
+      }), {
+        status: 500,
         headers: {
-          'Content-Type': 'text/plain',
+          'Content-Type': 'application/json',
           'Access-Control-Allow-Origin': '*'
         }
       });
     }
-
-    // 构建响应头
-    const responseHeaders = new Headers(result.response.headers);
-
-    // 添加 CORS 头
-    responseHeaders.set('Access-Control-Allow-Origin', '*');
-    responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    responseHeaders.set('Access-Control-Allow-Headers', '*');
-
-    // 添加调试信息头
-    responseHeaders.set('X-Used-Endpoint', ENDPOINTS[result.endpointIndex]);
-    responseHeaders.set('X-Endpoint-Index', result.endpointIndex.toString());
-    if (preferredEndpoint) {
-      responseHeaders.set('X-Preferred-Endpoint', preferredEndpoint);
-    }
-
-    return new Response(result.response.body, {
-      status: result.response.status,
-      statusText: result.response.statusText,
-      headers: responseHeaders
-    });
   }
 };
