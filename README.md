@@ -167,9 +167,10 @@ curl https://your-worker.workers.dev/v1/chat/completions \
 - ✅ 自动将 Claude 响应格式转换为 OpenAI Chat Completions 格式
 - ✅ 支持 `system`、`user`、`assistant` 角色
 - ✅ 支持 `temperature`、`top_p`、`max_tokens`、`stop` 等参数
-- ✅ 支持流式响应（`stream: true`）
+- ✅ 支持流式响应（`stream: true`），实时转换 SSE 格式
 - ✅ 支持 `/v1/models` 接口获取可用模型列表
 - ✅ 完整的端点路由和故障转移支持
+- ✅ 自动过滤无效参数（如字符串 `"[undefined]"`）
 
 **指定端点的 OpenAI 格式调用**：
 ```bash
@@ -249,6 +250,30 @@ Claude 原生格式响应（使用 `/v1/messages`）：
   "usage": {"input_tokens": 20, "output_tokens": 10}
 }
 ```
+
+**流式响应说明**：
+
+Worker 会自动将 Claude 的 Server-Sent Events (SSE) 格式转换为 OpenAI 的 SSE 格式：
+
+Claude SSE 事件：
+```
+data: {"type":"message_start","message":{"id":"msg_123","role":"assistant"}}
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}
+data: {"type":"message_stop"}
+```
+
+转换为 OpenAI SSE 格式：
+```
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+data: [DONE]
+```
+
+这使得任何支持 OpenAI API 的客户端都可以无缝使用 Claude API，包括：
+- 官方 OpenAI SDK
+- LangChain
+- LlamaIndex
+- 各种 OpenAI 兼容的聊天界面
 
 ## 调试
 

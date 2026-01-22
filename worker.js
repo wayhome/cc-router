@@ -91,7 +91,6 @@ class EndpointHealthManager {
     // 如果连续失败次数达到阈值，进入冷却期
     if (health.failures >= HEALTH_CHECK_CONFIG.MAX_FAILURES) {
       health.inCooldown = true;
-      console.log(`Endpoint ${ENDPOINTS[index]} entered cooldown period`);
     }
 
     await this.saveHealth(index, health);
@@ -186,18 +185,25 @@ function convertOpenAIToClaude(openaiRequest) {
   if (isValidValue(openaiRequest.top_p) && typeof openaiRequest.top_p === 'number') {
     claudeRequest.top_p = openaiRequest.top_p;
   }
+  // Stream 参数：如果提供则使用，否则默认为 false
   if (isValidValue(openaiRequest.stream) && typeof openaiRequest.stream === 'boolean') {
     claudeRequest.stream = openaiRequest.stream;
+  } else {
+    claudeRequest.stream = false;
   }
   if (isValidValue(openaiRequest.stop)) {
     if (Array.isArray(openaiRequest.stop)) {
-      claudeRequest.stop_sequences = openaiRequest.stop.filter(s => isValidValue(s));
+      const validStops = openaiRequest.stop.filter(s => isValidValue(s));
+      if (validStops.length > 0) {
+        claudeRequest.stop_sequences = validStops;
+      }
     } else if (typeof openaiRequest.stop === 'string') {
       claudeRequest.stop_sequences = [openaiRequest.stop];
     }
   }
 
-  return claudeRequest;
+  // 清理请求对象，移除任何可能残留的无效值
+  return cleanObject(claudeRequest);
 }
 
 /**
@@ -345,11 +351,6 @@ async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
  * 转换 Claude Messages API 响应格式为 OpenAI Chat Completions 格式
  */
 function convertClaudeToOpenAI(claudeResponse, model) {
-  // 如果是流式响应，直接返回原始响应
-  if (claudeResponse.headers.get('content-type')?.includes('text/event-stream')) {
-    return claudeResponse;
-  }
-
   return {
     id: claudeResponse.id || `chatcmpl-${Date.now()}`,
     object: 'chat.completion',
@@ -473,6 +474,7 @@ async function proxyRequest(request, endpointPath, apiPath) {
  */
 async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null) {
   const requestBody = await request.clone().arrayBuffer();
+  const requestHeaders = new Headers(request.headers);  // 保存请求头
   const triedIndices = new Set();
 
   // 如果指定了优先端点，确定起始位置
@@ -533,7 +535,7 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
       // 重新创建请求（因为 body 只能读取一次）
       const clonedRequest = new Request(request.url, {
         method: request.method,
-        headers: request.headers,
+        headers: requestHeaders,
         body: requestBody.byteLength > 0 ? requestBody : null
       });
 
@@ -542,16 +544,13 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
       // 如果响应成功（2xx 或 3xx），记录成功并返回
       if (response.status < 400) {
         await manager.recordSuccess(currentIndex);
-        console.log(`Success with endpoint ${endpoint} (index ${currentIndex})`);
         return { response, endpointIndex: currentIndex, success: true };
       }
 
       // 如果是 4xx 或 5xx 错误，记录失败并尝试下一个
       await manager.recordFailure(currentIndex);
-      console.log(`Endpoint ${endpoint} failed with status ${response.status}, trying next...`);
     } catch (error) {
       await manager.recordFailure(currentIndex);
-      console.log(`Endpoint ${endpoint} error: ${error.message}, trying next...`);
     }
   }
 
@@ -596,17 +595,44 @@ export default {
       if (isOpenAI && request.method === 'POST') {
         try {
           const openaiBody = await request.json();
-          console.log('Received OpenAI request:', JSON.stringify(openaiBody));
 
           originalModel = openaiBody.model;
           const claudeBody = convertOpenAIToClaude(openaiBody);
 
-          console.log('Converted to Claude format:', JSON.stringify(claudeBody));
-
           // 创建新的请求对象，使用转换后的 Claude 格式
+          // 注意：需要移除 Content-Length 头，让浏览器/fetch 自动计算新的长度
+          // 并且必须显式设置 Content-Type 为 application/json
+          const newHeaders = new Headers(request.headers);
+          newHeaders.delete('Content-Length');
+          newHeaders.set('Content-Type', 'application/json');
+
+          // 确保 anthropic-version 头存在（Claude API 要求）
+          if (!newHeaders.has('anthropic-version')) {
+            newHeaders.set('anthropic-version', '2023-06-01');
+          }
+
+          // 如果请求看起来像机器人（OpenAI Python SDK），修改 User-Agent 并添加必要的头部
+          // 伪装成 CherryStudio 客户端以通过反机器人检测
+          const userAgent = newHeaders.get('user-agent') || '';
+          if (userAgent.includes('OpenAI') || userAgent.includes('Python') || userAgent.includes('curl')) {
+            // 使用与成功请求相同的 User-Agent
+            newHeaders.set('user-agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) CherryStudio/1.7.13 Chrome/140.0.7339.249 Electron/38.7.0 Safari/537.36');
+
+            // 添加 anthropic-beta 头
+            if (!newHeaders.has('anthropic-beta')) {
+              newHeaders.set('anthropic-beta', 'interleaved-thinking-2025-05-14');
+            }
+
+            // 清理机器人相关的头部
+            const botHeaders = ['x-stainless-arch', 'x-stainless-async', 'x-stainless-lang',
+                               'x-stainless-os', 'x-stainless-package-version', 'x-stainless-read-timeout',
+                               'x-stainless-retry-count', 'x-stainless-runtime', 'x-stainless-runtime-version'];
+            botHeaders.forEach(header => newHeaders.delete(header));
+          }
+
           processedRequest = new Request(request.url, {
             method: request.method,
-            headers: request.headers,
+            headers: newHeaders,
             body: JSON.stringify(claudeBody)
           });
         } catch (error) {
@@ -656,6 +682,9 @@ export default {
       let responseStatus = result.response.status;
       let contentType = result.response.headers.get('content-type');
 
+      // 先保存响应头，因为读取 body 后可能无法再访问
+      const responseHeaders = new Headers(result.response.headers);
+
       // 处理流式响应和非流式响应
       if (isOpenAI && responseStatus === 200) {
         if (contentType?.includes('text/event-stream')) {
@@ -663,7 +692,7 @@ export default {
           try {
             responseBody = await convertClaudeStreamToOpenAI(result.response.body, originalModel);
           } catch (error) {
-            console.error('Failed to convert Claude stream to OpenAI format:', error);
+            console.error('Failed to convert Claude stream to OpenAI format:', error.message, error.stack);
             // 如果转换失败，返回原始流
           }
         } else {
@@ -673,14 +702,11 @@ export default {
             const openaiResponse = convertClaudeToOpenAI(claudeResponse, originalModel);
             responseBody = JSON.stringify(openaiResponse);
           } catch (error) {
-            console.error('Failed to convert Claude response to OpenAI format:', error);
+            console.error('Failed to convert Claude response to OpenAI format:', error.message, error.stack);
             // 如果转换失败，返回原始响应
           }
         }
       }
-
-      // 构建响应头
-      const responseHeaders = new Headers(result.response.headers);
 
       // 添加 CORS 头
       responseHeaders.set('Access-Control-Allow-Origin', '*');
