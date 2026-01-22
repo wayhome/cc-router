@@ -29,6 +29,20 @@
 - 使用 `ANTHROPIC_AUTH_TOKEN` 而不是 `apiKey`
 - 使用 `ANTHROPIC_BASE_URL` 而不是 `apiUrl`
 - 配置文件位置是 `~/.claude/settings.json`
+- 默认配置使用自动路由，Worker 会从最便宜的 droid 端点开始尝试
+
+**高级配置**：你也可以指定特定端点作为基础 URL：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "替换为您的API Key",
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev/claude/droid"
+  }
+}
+```
+
+这样配置后，所有请求都会优先使用 droid 端点，失败时从 droid 位置往后尝试（aws → ultra → super → claude）。
 
 #### VSCode 扩展配置
 
@@ -61,8 +75,19 @@ export ANTHROPIC_API_KEY=your-api-key
 # 使用 Claude Code CLI
 claude chat "Hello, Claude"
 
-# 或使用 curl
+# 或使用 curl（自动路由）
 curl https://your-worker.workers.dev/v1/messages \
+  -H "x-api-key: your-api-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-3-5-sonnet-20241022",
+    "max_tokens": 100,
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+
+# 或指定优先端点（如 aws）
+curl https://your-worker.workers.dev/claude/aws/v1/messages \
   -H "x-api-key: your-api-key" \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
@@ -73,7 +98,9 @@ curl https://your-worker.workers.dev/v1/messages \
   }'
 ```
 
-查看响应头中的 `X-Used-Endpoint` 可以确认使用了哪个后端端点。
+查看响应头中的调试信息：
+- `X-Used-Endpoint`: 实际使用的端点
+- `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
 
 ## 工作原理
 
@@ -82,18 +109,62 @@ Claude Code CLI/VSCode
         ↓
   Your Cloudflare Worker
         ↓
-智能路由（按价格优先）:
-  1. code.newcli.com/claude/aws
-  2. code.newcli.com/claude/droid
-  3. code.newcli.com/claude/ultra
-  4. code.newcli.com/claude
+解析请求路径，提取优先端点
+        ↓
+智能路由:
+  - 如果指定了优先端点，从该位置开始往后尝试
+    例如指定 aws: aws → ultra → super → claude → droid
+  - 否则按价格从低到高尝试:
+    1. code.newcli.com/claude/droid
+    2. code.newcli.com/claude/aws
+    3. code.newcli.com/claude/ultra
+    4. code.newcli.com/claude/super
+    5. code.newcli.com/claude
 ```
 
 Worker 会：
 1. 接收来自 Claude Code 的请求
-2. 自动选择最便宜且可用的端点
-3. 透明转发请求和响应
-4. 遇到错误时自动切换到下一个端点
+2. 解析路径，识别是否指定了优先端点
+3. 如果指定了优先端点，从该位置往后尝试；否则从最便宜的端点开始
+4. 透明转发请求和响应
+5. 遇到错误时自动切换到下一个端点
+
+## 使用指定端点路由（高级功能）
+
+除了默认的自动路由，你还可以通过路径指定优先使用的端点。
+
+### 在 Claude Code 中使用指定端点
+
+虽然 Claude Code 默认会使用配置的 `ANTHROPIC_BASE_URL`，但你可以通过修改配置来使用特定端点：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "your-api-key",
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev/claude/aws"
+  }
+}
+```
+
+这样配置后，所有请求都会优先使用 aws 端点，失败时从 aws 位置往后尝试（ultra → super → claude），最后才尝试更便宜的 droid 端点。
+
+### 支持的端点路径
+
+- `https://your-worker.workers.dev/claude/droid` - 优先使用 droid 端点（最便宜）
+- `https://your-worker.workers.dev/claude/aws` - 优先使用 aws 端点
+- `https://your-worker.workers.dev/claude/ultra` - 优先使用 ultra 端点
+- `https://your-worker.workers.dev/claude/super` - 优先使用 super 端点
+- `https://your-worker.workers.dev/claude` - 优先使用 claude 端点（最贵）
+- `https://your-worker.workers.dev` - 自动路由（默认，推荐）
+
+### 使用场景
+
+1. **测试特定端点**: 当你想测试某个端点的性能或可用性时
+2. **成本控制**: 强制使用最便宜的端点
+3. **性能优化**: 如果你发现某个端点在你的地区速度更快
+4. **调试问题**: 排查特定端点的问题
+
+**注意**: 大多数情况下，使用默认的自动路由即可，Worker 会自动选择最优端点。
 
 ## 监控和调试
 
@@ -101,7 +172,8 @@ Worker 会：
 
 响应头中包含：
 - `X-Used-Endpoint`: 实际使用的端点路径
-- `X-Endpoint-Index`: 端点索引（0-3）
+- `X-Endpoint-Index`: 端点索引（0=droid, 1=aws, 2=ultra, 3=super, 4=claude）
+- `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
 
 ### 查看 Worker 日志
 

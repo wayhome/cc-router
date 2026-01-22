@@ -6,14 +6,15 @@
  * - 使用全局内存缓存记录端点健康状态（同一实例内共享）
  * - 自动故障转移，优先使用最便宜的可用端点
  * - 失败的端点会被临时标记，一段时间后重新尝试
+ * - 支持指定端点路由，优先使用对应的实际端点
  */
 
 const TARGET_BASE_URL = 'https://code.newcli.com';
 
 // 可用的端点列表（按价格从低到高排序）
 const ENDPOINTS = [
-  '/claude/aws',      // 最便宜
-  '/claude/droid',
+  '/claude/droid',    // 最便宜
+  '/claude/aws',
   '/claude/ultra',
   '/claude/super',    // 次贵
   '/claude'           // 最贵
@@ -114,11 +115,31 @@ class EndpointHealthManager {
 }
 
 /**
+ * 解析请求路径，提取端点信息
+ * 返回 { preferredEndpoint: string|null, apiPath: string }
+ */
+function parseRequestPath(url) {
+  const pathname = new URL(url).pathname;
+
+  // 检查是否匹配端点路径
+  for (const endpoint of ENDPOINTS) {
+    if (pathname.startsWith(endpoint + '/') || pathname === endpoint) {
+      // 提取端点后的 API 路径
+      const apiPath = pathname.slice(endpoint.length) || '/';
+      return { preferredEndpoint: endpoint, apiPath };
+    }
+  }
+
+  // 没有匹配到特定端点，使用默认路由
+  return { preferredEndpoint: null, apiPath: pathname };
+}
+
+/**
  * 代理请求到指定端点
  */
-async function proxyRequest(request, endpointPath) {
+async function proxyRequest(request, endpointPath, apiPath) {
   const url = new URL(request.url);
-  const targetUrl = `${TARGET_BASE_URL}${endpointPath}${url.pathname}${url.search}`;
+  const targetUrl = `${TARGET_BASE_URL}${endpointPath}${apiPath}${url.search}`;
 
   const headers = new Headers(request.headers);
 
@@ -134,29 +155,58 @@ async function proxyRequest(request, endpointPath) {
 
 /**
  * 尝试所有端点，直到成功或全部失败
- * 优先使用价格最低的可用端点
+ * 如果指定了 preferredEndpoint，优先使用该端点，失败后从该位置往后尝试
+ * 否则按价格从低到高尝试
  */
-async function tryEndpoints(request, manager) {
+async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null) {
   const requestBody = await request.clone().arrayBuffer();
   const triedIndices = new Set();
 
-  // 按价格顺序尝试所有端点
+  // 如果指定了优先端点，确定起始位置
+  let startIndex = 0;
+  if (preferredEndpoint) {
+    const preferredIndex = ENDPOINTS.indexOf(preferredEndpoint);
+    if (preferredIndex !== -1) {
+      startIndex = preferredIndex;
+    }
+  }
+
+  // 按优先级顺序尝试所有端点
   for (let attempt = 0; attempt < ENDPOINTS.length; attempt++) {
-    // 获取下一个可用的端点（优先最便宜的）
     let currentIndex = -1;
-    for (let i = 0; i < ENDPOINTS.length; i++) {
+
+    // 从起始位置开始，按顺序查找下一个可用端点
+    for (let i = startIndex; i < ENDPOINTS.length; i++) {
       if (!triedIndices.has(i) && await manager.isAvailable(i)) {
         currentIndex = i;
         break;
       }
     }
 
-    // 如果没有可用端点，尝试任何未尝试的端点
+    // 如果从起始位置往后没找到，尝试起始位置之前的端点
+    if (currentIndex === -1 && startIndex > 0) {
+      for (let i = 0; i < startIndex; i++) {
+        if (!triedIndices.has(i) && await manager.isAvailable(i)) {
+          currentIndex = i;
+          break;
+        }
+      }
+    }
+
+    // 如果还是没有可用端点，尝试任何未尝试的端点（包括冷却期的）
     if (currentIndex === -1) {
-      for (let i = 0; i < ENDPOINTS.length; i++) {
+      for (let i = startIndex; i < ENDPOINTS.length; i++) {
         if (!triedIndices.has(i)) {
           currentIndex = i;
           break;
+        }
+      }
+      if (currentIndex === -1 && startIndex > 0) {
+        for (let i = 0; i < startIndex; i++) {
+          if (!triedIndices.has(i)) {
+            currentIndex = i;
+            break;
+          }
         }
       }
     }
@@ -174,7 +224,7 @@ async function tryEndpoints(request, manager) {
         body: requestBody.byteLength > 0 ? requestBody : null
       });
 
-      const response = await proxyRequest(clonedRequest, endpoint);
+      const response = await proxyRequest(clonedRequest, endpoint, apiPath);
 
       // 如果响应成功（2xx 或 3xx），记录成功并返回
       if (response.status < 400) {
@@ -211,11 +261,14 @@ export default {
       });
     }
 
+    // 解析请求路径，提取优先端点和 API 路径
+    const { preferredEndpoint, apiPath } = parseRequestPath(request.url);
+
     // 创建健康管理器
     const manager = new EndpointHealthManager();
 
-    // 尝试所有端点（按价格从低到高）
-    const result = await tryEndpoints(request, manager);
+    // 尝试所有端点（如果指定了优先端点，先尝试它）
+    const result = await tryEndpoints(request, manager, apiPath, preferredEndpoint);
 
     if (!result.success) {
       return new Response('All endpoints failed', {
@@ -238,6 +291,9 @@ export default {
     // 添加调试信息头
     responseHeaders.set('X-Used-Endpoint', ENDPOINTS[result.endpointIndex]);
     responseHeaders.set('X-Endpoint-Index', result.endpointIndex.toString());
+    if (preferredEndpoint) {
+      responseHeaders.set('X-Preferred-Endpoint', preferredEndpoint);
+    }
 
     return new Response(result.response.body, {
       status: result.response.status,

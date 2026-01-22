@@ -8,7 +8,8 @@
 
 ## 功能特性
 
-- **价格优先**: 按价格从低到高尝试端点（aws < droid < ultra < claude）
+- **价格优先**: 按价格从低到高尝试端点（droid < aws < ultra < super < claude）
+- **指定端点路由**: 支持通过路径指定优先使用的端点（如 `/claude/aws/v1/messages`）
 - **智能故障转移**: 遇到 4xx/5xx 错误自动切换到下一个端点
 - **内存状态管理**: 使用全局内存缓存记录端点健康状态（同一实例内共享）
 - **自动冷却**: 连续失败 3 次的端点会被标记为不可用 1 分钟
@@ -36,7 +37,10 @@
 
 4. 开始使用！Worker 会自动选择最便宜的可用端点
 
-详细配置请查看 [Claude Code 配置指南](CLAUDE_CODE_SETUP.md)。
+**提示**：
+- 默认配置使用自动路由，从最便宜的 droid 端点开始尝试
+- 你也可以指定特定端点，如 `https://your-worker.workers.dev/claude/droid`
+- 详细配置请查看 [Claude Code 配置指南](CLAUDE_CODE_SETUP.md)
 
 ## 部署步骤
 
@@ -74,7 +78,9 @@ wrangler deploy
 
 ## 使用方法
 
-将所有 Claude API 请求发送到你的 Worker URL：
+### 方式 1: 自动路由（默认）
+
+将所有 Claude API 请求发送到你的 Worker URL，Worker 会自动选择最便宜的可用端点：
 
 ```bash
 curl https://your-worker.workers.dev/v1/messages \
@@ -91,16 +97,55 @@ curl https://your-worker.workers.dev/v1/messages \
 ```
 
 Worker 会自动：
-1. 优先尝试最便宜的 `/claude/aws` 端点
-2. 如果失败，自动切换到 `/claude/droid`
-3. 继续尝试 `/claude/ultra` 和 `/claude`
+1. 优先尝试最便宜的 `/claude/droid` 端点
+2. 如果失败，自动切换到 `/claude/aws`
+3. 继续尝试 `/claude/ultra`、`/claude/super` 和 `/claude`
 4. 记录失败状态，连续失败 3 次后暂时跳过该端点
+
+### 方式 2: 指定端点路由（新功能）
+
+通过在路径中指定端点名称，可以优先使用特定端点：
+
+```bash
+# 优先使用 aws 端点
+curl https://your-worker.workers.dev/claude/aws/v1/messages \
+  -H "x-api-key: your-api-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-3-5-sonnet-20241022",
+    "max_tokens": 1024,
+    "messages": [
+      {"role": "user", "content": "Hello, Claude"}
+    ]
+  }'
+
+# 优先使用 super 端点
+curl https://your-worker.workers.dev/claude/super/v1/messages \
+  -H "x-api-key: your-api-key" \
+  ...
+```
+
+**工作原理**：
+- 首先尝试指定的端点（如 `/claude/aws`）
+- 如果指定端点失败，从该端点位置往后尝试更贵的端点（aws → ultra → super → claude）
+- 如果后面的端点都失败，再尝试前面更便宜的端点（droid）
+- 保持完整的故障转移和健康检查机制
+
+**支持的端点路径**：
+- `/claude/aws/v1/messages` - 优先使用 aws 端点
+- `/claude/droid/v1/messages` - 优先使用 droid 端点
+- `/claude/ultra/v1/messages` - 优先使用 ultra 端点
+- `/claude/super/v1/messages` - 优先使用 super 端点
+- `/claude/v1/messages` - 优先使用 claude 端点
+- `/v1/messages` - 自动路由（默认行为）
 
 ## 调试
 
 响应头中包含调试信息：
 - `X-Used-Endpoint`: 实际使用的端点路径
-- `X-Endpoint-Index`: 端点索引（0=aws, 1=droid, 2=ultra, 3=claude）
+- `X-Endpoint-Index`: 端点索引（0=droid, 1=aws, 2=ultra, 3=super, 4=claude）
+- `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
 
 查看日志：
 ```bash
@@ -133,17 +178,23 @@ const HEALTH_CHECK_CONFIG = {
   ↓
 Cloudflare Worker
   ↓
+解析请求路径，提取优先端点
+  ↓
 检查内存缓存中的端点健康状态
   ↓
-按价格顺序尝试可用端点:
-  1. /claude/aws (最便宜)
-  2. /claude/droid
-  3. /claude/ultra
-  4. /claude (最贵)
+按优先级顺序尝试端点:
+  - 如果指定了优先端点，从该位置开始往后尝试
+    例如指定 ultra: ultra → super → claude → droid → aws
+  - 否则按价格顺序尝试:
+    1. /claude/droid (最便宜)
+    2. /claude/aws
+    3. /claude/ultra
+    4. /claude/super
+    5. /claude (最贵)
   ↓
 记录成功/失败到内存缓存
   ↓
-返回响应
+返回响应（包含调试信息头）
 ```
 
 ## License
