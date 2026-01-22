@@ -4,6 +4,8 @@
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/your-username/cc-router)
 
+**🎁 [获取 API Key](https://foxcode.rjj.cc/auth/register?aff=UI2TST)** - 注册获取 Claude API 访问权限
+
 **📘 [Claude Code 配置指南](CLAUDE_CODE_SETUP.md)** - 查看如何在 Claude Code CLI 和 VSCode 扩展中使用
 
 ## 功能特性
