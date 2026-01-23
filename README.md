@@ -14,6 +14,7 @@
 - **指定端点路由**: 支持通过路径指定优先使用的端点（如 `/claude/aws/v1/messages`）
 - **OpenAI 兼容接口**: 支持 OpenAI Chat Completions API 格式，自动转换为 Claude API
 - **智能故障转移**: 遇到 4xx/5xx 错误自动切换到下一个端点
+- **双源互备**: 主源 (newcli) 和备源 (dm-fox) 相互备份，单个端点失败时先尝试备源的相同端点
 - **内存状态管理**: 使用全局内存缓存记录端点健康状态（同一实例内共享）
 - **自动冷却**: 连续失败 3 次的端点会被标记为不可用 1 分钟
 - **自动恢复**: 冷却期结束后端点自动恢复可用
@@ -280,6 +281,8 @@ data: [DONE]
 响应头中包含调试信息：
 - `X-Used-Endpoint`: 实际使用的端点路径
 - `X-Endpoint-Index`: 端点索引（0=droid, 1=aws, 2=ultra, 3=super, 4=claude）
+- `X-Used-Base-URL`: 实际使用的基础 URL（主源或备源）
+- `X-Base-URL-Index`: 基础 URL 索引（0=主源 newcli, 1=备源 dm-fox）
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
 - `X-Format-Conversion`: 如果使用了 OpenAI 格式转换，显示 "OpenAI"
 
@@ -328,10 +331,47 @@ Cloudflare Worker
     4. /claude/super
     5. /claude (最贵)
   ↓
-记录成功/失败到内存缓存
+对于每个端点，依次尝试两个源:
+  1. 主源 (code.newcli.com)
+  2. 备源 (dm-fox.rjj.cc)
+  - 只有两个源都失败才切换到下一个端点
+  ↓
+记录成功/失败到内存缓存（每个"端点+源"组合独立追踪）
   ↓
 返回响应（包含调试信息头）
 ```
+
+### 备源机制说明
+
+Worker 为每个端点配置了主源和备源，提供高可用性：
+
+- **主源**: `https://code.newcli.com` - 默认优先使用
+- **备源**: `https://dm-fox.rjj.cc` - 主源失败时自动切换
+
+**切换逻辑**：
+1. 尝试某个端点时，先尝试主源
+2. 如果主源失败（4xx/5xx 或网络错误），立即尝试备源的相同端点
+3. 只有两个源都失败后，才切换到下一个端点
+4. 每个"端点+源"组合独立追踪健康状态
+
+**示例**：
+```
+请求 /claude/aws/v1/messages
+  ↓
+尝试: code.newcli.com/claude/aws/v1/messages (失败)
+  ↓
+尝试: dm-fox.rjj.cc/claude/aws/v1/messages (成功) ✓
+  ↓
+返回响应，响应头显示:
+  X-Used-Endpoint: /claude/aws
+  X-Used-Base-URL: https://dm-fox.rjj.cc
+  X-Base-URL-Index: 1
+```
+
+这种设计确保了：
+- 优先使用价格最低的端点
+- 单个源故障不会导致服务中断
+- 最大化可用性和成本效益
 
 ## License
 

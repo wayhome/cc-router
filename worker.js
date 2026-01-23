@@ -8,9 +8,14 @@
  * - 失败的端点会被临时标记，一段时间后重新尝试
  * - 支持指定端点路由，优先使用对应的实际端点
  * - 支持 OpenAI Completions API 格式兼容
+ * - 双源互备：主源 (newcli) 和备源 (dm-fox) 相互备份，单个源失败时自动切换
  */
 
-const TARGET_BASE_URL = 'https://code.newcli.com';
+// 主源和备源配置
+const TARGET_BASE_URLS = [
+  'https://code.newcli.com',  // 主源
+  'https://dm-fox.rjj.cc'     // 备源
+];
 
 // 可用的端点列表（按价格从低到高排序）
 const ENDPOINTS = [
@@ -35,6 +40,7 @@ const HEALTH_CHECK_CONFIG = {
 /**
  * 端点健康状态管理类
  * 使用全局内存缓存存储健康状态（同一 Worker 实例内共享）
+ * 为每个"端点+源"组合单独追踪健康状态
  */
 class EndpointHealthManager {
   constructor() {
@@ -42,10 +48,20 @@ class EndpointHealthManager {
   }
 
   /**
+   * 生成健康状态的唯一键
+   * @param {number} endpointIndex - 端点索引
+   * @param {number} baseUrlIndex - 基础 URL 索引
+   */
+  getHealthKey(endpointIndex, baseUrlIndex) {
+    return `${endpointIndex}-${baseUrlIndex}`;
+  }
+
+  /**
    * 获取端点健康状态
    */
-  async getHealth(index) {
-    const health = globalHealthCache.get(index);
+  async getHealth(endpointIndex, baseUrlIndex) {
+    const key = this.getHealthKey(endpointIndex, baseUrlIndex);
+    const health = globalHealthCache.get(key);
 
     if (!health) {
       return { failures: 0, lastFailTime: 0, inCooldown: false };
@@ -57,15 +73,16 @@ class EndpointHealthManager {
   /**
    * 保存端点健康状态
    */
-  async saveHealth(index, health) {
-    globalHealthCache.set(index, health);
+  async saveHealth(endpointIndex, baseUrlIndex, health) {
+    const key = this.getHealthKey(endpointIndex, baseUrlIndex);
+    globalHealthCache.set(key, health);
   }
 
   /**
    * 检查端点是否可用
    */
-  async isAvailable(index) {
-    const health = await this.getHealth(index);
+  async isAvailable(endpointIndex, baseUrlIndex) {
+    const health = await this.getHealth(endpointIndex, baseUrlIndex);
     const now = Date.now();
 
     // 如果在冷却期，检查是否已过冷却时间
@@ -83,8 +100,8 @@ class EndpointHealthManager {
   /**
    * 记录端点失败
    */
-  async recordFailure(index) {
-    const health = await this.getHealth(index);
+  async recordFailure(endpointIndex, baseUrlIndex) {
+    const health = await this.getHealth(endpointIndex, baseUrlIndex);
     health.failures++;
     health.lastFailTime = Date.now();
 
@@ -93,18 +110,18 @@ class EndpointHealthManager {
       health.inCooldown = true;
     }
 
-    await this.saveHealth(index, health);
+    await this.saveHealth(endpointIndex, baseUrlIndex, health);
   }
 
   /**
    * 记录端点成功
    */
-  async recordSuccess(index) {
-    const health = await this.getHealth(index);
+  async recordSuccess(endpointIndex, baseUrlIndex) {
+    const health = await this.getHealth(endpointIndex, baseUrlIndex);
 
     // 只有在端点之前有失败记录或在冷却期时才需要重置
     if (health.failures > 0 || health.inCooldown) {
-      await this.saveHealth(index, {
+      await this.saveHealth(endpointIndex, baseUrlIndex, {
         failures: 0,
         lastFailTime: 0,
         inCooldown: false
@@ -450,10 +467,14 @@ function parseRequestPath(url) {
 
 /**
  * 代理请求到指定端点
+ * @param {Request} request - 原始请求
+ * @param {number} baseUrlIndex - 基础 URL 索引
+ * @param {string} endpointPath - 端点路径
+ * @param {string} apiPath - API 路径
  */
-async function proxyRequest(request, endpointPath, apiPath) {
+async function proxyRequest(request, baseUrlIndex, endpointPath, apiPath) {
   const url = new URL(request.url);
-  const targetUrl = `${TARGET_BASE_URL}${endpointPath}${apiPath}${url.search}`;
+  const targetUrl = `${TARGET_BASE_URLS[baseUrlIndex]}${endpointPath}${apiPath}${url.search}`;
 
   const headers = new Headers(request.headers);
 
@@ -471,11 +492,12 @@ async function proxyRequest(request, endpointPath, apiPath) {
  * 尝试所有端点，直到成功或全部失败
  * 如果指定了 preferredEndpoint，优先使用该端点，失败后从该位置往后尝试
  * 否则按价格从低到高尝试
+ * 对于每个端点，会先尝试主源，失败后尝试备源，两个源都失败才切换到下一个端点
  */
 async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null) {
   const requestBody = await request.clone().arrayBuffer();
   const requestHeaders = new Headers(request.headers);  // 保存请求头
-  const triedIndices = new Set();
+  const triedEndpoints = new Set();  // 记录已尝试的端点（不含源信息）
 
   // 如果指定了优先端点，确定起始位置
   let startIndex = 0;
@@ -490,9 +512,20 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
   for (let attempt = 0; attempt < ENDPOINTS.length; attempt++) {
     let currentIndex = -1;
 
-    // 从起始位置开始，按顺序查找下一个可用端点
+    // 从起始位置开始，按顺序查找下一个可用端点（至少一个源可用）
     for (let i = startIndex; i < ENDPOINTS.length; i++) {
-      if (!triedIndices.has(i) && await manager.isAvailable(i)) {
+      if (triedEndpoints.has(i)) continue;
+
+      // 检查该端点是否至少有一个源可用
+      let hasAvailableSource = false;
+      for (let baseUrlIndex = 0; baseUrlIndex < TARGET_BASE_URLS.length; baseUrlIndex++) {
+        if (await manager.isAvailable(i, baseUrlIndex)) {
+          hasAvailableSource = true;
+          break;
+        }
+      }
+
+      if (hasAvailableSource) {
         currentIndex = i;
         break;
       }
@@ -501,7 +534,17 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
     // 如果从起始位置往后没找到，尝试起始位置之前的端点
     if (currentIndex === -1 && startIndex > 0) {
       for (let i = 0; i < startIndex; i++) {
-        if (!triedIndices.has(i) && await manager.isAvailable(i)) {
+        if (triedEndpoints.has(i)) continue;
+
+        let hasAvailableSource = false;
+        for (let baseUrlIndex = 0; baseUrlIndex < TARGET_BASE_URLS.length; baseUrlIndex++) {
+          if (await manager.isAvailable(i, baseUrlIndex)) {
+            hasAvailableSource = true;
+            break;
+          }
+        }
+
+        if (hasAvailableSource) {
           currentIndex = i;
           break;
         }
@@ -511,14 +554,14 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
     // 如果还是没有可用端点，尝试任何未尝试的端点（包括冷却期的）
     if (currentIndex === -1) {
       for (let i = startIndex; i < ENDPOINTS.length; i++) {
-        if (!triedIndices.has(i)) {
+        if (!triedEndpoints.has(i)) {
           currentIndex = i;
           break;
         }
       }
       if (currentIndex === -1 && startIndex > 0) {
         for (let i = 0; i < startIndex; i++) {
-          if (!triedIndices.has(i)) {
+          if (!triedEndpoints.has(i)) {
             currentIndex = i;
             break;
           }
@@ -528,34 +571,44 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
 
     if (currentIndex === -1) break;
 
-    triedIndices.add(currentIndex);
+    triedEndpoints.add(currentIndex);
     const endpoint = ENDPOINTS[currentIndex];
 
-    try {
-      // 重新创建请求（因为 body 只能读取一次）
-      const clonedRequest = new Request(request.url, {
-        method: request.method,
-        headers: requestHeaders,
-        body: requestBody.byteLength > 0 ? requestBody : null
-      });
+    // 对于当前端点，依次尝试所有源（主源 -> 备源）
+    for (let baseUrlIndex = 0; baseUrlIndex < TARGET_BASE_URLS.length; baseUrlIndex++) {
+      try {
+        // 重新创建请求（因为 body 只能读取一次）
+        const clonedRequest = new Request(request.url, {
+          method: request.method,
+          headers: requestHeaders,
+          body: requestBody.byteLength > 0 ? requestBody : null
+        });
 
-      const response = await proxyRequest(clonedRequest, endpoint, apiPath);
+        const response = await proxyRequest(clonedRequest, baseUrlIndex, endpoint, apiPath);
 
-      // 如果响应成功（2xx 或 3xx），记录成功并返回
-      if (response.status < 400) {
-        await manager.recordSuccess(currentIndex);
-        return { response, endpointIndex: currentIndex, success: true };
+        // 如果响应成功（2xx 或 3xx），记录成功并返回
+        if (response.status < 400) {
+          await manager.recordSuccess(currentIndex, baseUrlIndex);
+          return {
+            response,
+            endpointIndex: currentIndex,
+            baseUrlIndex,
+            success: true
+          };
+        }
+
+        // 如果是 4xx 或 5xx 错误，记录失败并尝试下一个源
+        await manager.recordFailure(currentIndex, baseUrlIndex);
+      } catch (error) {
+        await manager.recordFailure(currentIndex, baseUrlIndex);
       }
-
-      // 如果是 4xx 或 5xx 错误，记录失败并尝试下一个
-      await manager.recordFailure(currentIndex);
-    } catch (error) {
-      await manager.recordFailure(currentIndex);
     }
+
+    // 所有源都失败了，继续尝试下一个端点
   }
 
-  // 所有端点都失败了
-  return { response: null, endpointIndex: -1, success: false };
+  // 所有端点的所有源都失败了
+  return { response: null, endpointIndex: -1, baseUrlIndex: -1, success: false };
 }
 
 export default {
@@ -716,6 +769,8 @@ export default {
       // 添加调试信息头
       responseHeaders.set('X-Used-Endpoint', ENDPOINTS[result.endpointIndex]);
       responseHeaders.set('X-Endpoint-Index', result.endpointIndex.toString());
+      responseHeaders.set('X-Used-Base-URL', TARGET_BASE_URLS[result.baseUrlIndex]);
+      responseHeaders.set('X-Base-URL-Index', result.baseUrlIndex.toString());
       if (preferredEndpoint) {
         responseHeaders.set('X-Preferred-Endpoint', preferredEndpoint);
       }
