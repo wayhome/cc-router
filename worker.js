@@ -9,6 +9,7 @@
  * - 支持指定端点路由，优先使用对应的实际端点
  * - 支持 OpenAI Completions API 格式兼容
  * - 双源互备：主源 (newcli) 和备源 (dm-fox) 相互备份，单个源失败时自动切换
+ * - 支持 Codex 路由透传（/codex/v1），单端点主备源重试
  */
 
 // 主源和备源配置
@@ -25,6 +26,12 @@ const ENDPOINTS = [
   '/claude/super',    // 次贵
   '/claude'           // 最贵
 ];
+
+const CODEX_BASE_PATH = '/codex/v1';
+const ROUTE_TYPES = {
+  CLAUDE: 'claude',
+  CODEX: 'codex'
+};
 
 // 全局健康状态缓存（跨请求共享，同一 Worker 实例内所有请求共享）
 const globalHealthCache = new Map();
@@ -49,18 +56,19 @@ class EndpointHealthManager {
 
   /**
    * 生成健康状态的唯一键
+   * @param {string} routeType - 路由类型（claude/codex）
    * @param {number} endpointIndex - 端点索引
    * @param {number} baseUrlIndex - 基础 URL 索引
    */
-  getHealthKey(endpointIndex, baseUrlIndex) {
-    return `${endpointIndex}-${baseUrlIndex}`;
+  getHealthKey(routeType, endpointIndex, baseUrlIndex) {
+    return `${routeType}-${endpointIndex}-${baseUrlIndex}`;
   }
 
   /**
    * 获取端点健康状态
    */
-  async getHealth(endpointIndex, baseUrlIndex) {
-    const key = this.getHealthKey(endpointIndex, baseUrlIndex);
+  async getHealth(endpointIndex, baseUrlIndex, routeType = ROUTE_TYPES.CLAUDE) {
+    const key = this.getHealthKey(routeType, endpointIndex, baseUrlIndex);
     const health = globalHealthCache.get(key);
 
     if (!health) {
@@ -73,16 +81,16 @@ class EndpointHealthManager {
   /**
    * 保存端点健康状态
    */
-  async saveHealth(endpointIndex, baseUrlIndex, health) {
-    const key = this.getHealthKey(endpointIndex, baseUrlIndex);
+  async saveHealth(endpointIndex, baseUrlIndex, health, routeType = ROUTE_TYPES.CLAUDE) {
+    const key = this.getHealthKey(routeType, endpointIndex, baseUrlIndex);
     globalHealthCache.set(key, health);
   }
 
   /**
    * 检查端点是否可用
    */
-  async isAvailable(endpointIndex, baseUrlIndex) {
-    const health = await this.getHealth(endpointIndex, baseUrlIndex);
+  async isAvailable(endpointIndex, baseUrlIndex, routeType = ROUTE_TYPES.CLAUDE) {
+    const health = await this.getHealth(endpointIndex, baseUrlIndex, routeType);
     const now = Date.now();
 
     // 如果在冷却期，检查是否已过冷却时间
@@ -100,8 +108,8 @@ class EndpointHealthManager {
   /**
    * 记录端点失败
    */
-  async recordFailure(endpointIndex, baseUrlIndex) {
-    const health = await this.getHealth(endpointIndex, baseUrlIndex);
+  async recordFailure(endpointIndex, baseUrlIndex, routeType = ROUTE_TYPES.CLAUDE) {
+    const health = await this.getHealth(endpointIndex, baseUrlIndex, routeType);
     health.failures++;
     health.lastFailTime = Date.now();
 
@@ -110,14 +118,14 @@ class EndpointHealthManager {
       health.inCooldown = true;
     }
 
-    await this.saveHealth(endpointIndex, baseUrlIndex, health);
+    await this.saveHealth(endpointIndex, baseUrlIndex, health, routeType);
   }
 
   /**
    * 记录端点成功
    */
-  async recordSuccess(endpointIndex, baseUrlIndex) {
-    const health = await this.getHealth(endpointIndex, baseUrlIndex);
+  async recordSuccess(endpointIndex, baseUrlIndex, routeType = ROUTE_TYPES.CLAUDE) {
+    const health = await this.getHealth(endpointIndex, baseUrlIndex, routeType);
 
     // 只有在端点之前有失败记录或在冷却期时才需要重置
     if (health.failures > 0 || health.inCooldown) {
@@ -125,7 +133,7 @@ class EndpointHealthManager {
         failures: 0,
         lastFailTime: 0,
         inCooldown: false
-      });
+      }, routeType);
     }
     // 如果端点一直健康，不需要写入缓存
   }
@@ -416,14 +424,26 @@ function getOpenAIModelsResponse() {
 
 /**
  * 解析请求路径，提取端点信息
- * 返回 { preferredEndpoint: string|null, apiPath: string, isOpenAI: boolean, isModels: boolean }
+ * 返回 { routeType: string, preferredEndpoint: string|null, apiPath: string, isOpenAI: boolean, isModels: boolean }
  */
 function parseRequestPath(url) {
   const pathname = new URL(url).pathname;
 
+  // Codex 路由优先，避免被 OpenAI 兼容分支误匹配
+  if (pathname === CODEX_BASE_PATH || pathname.startsWith(`${CODEX_BASE_PATH}/`)) {
+    return {
+      routeType: ROUTE_TYPES.CODEX,
+      preferredEndpoint: null,
+      apiPath: pathname,
+      isOpenAI: false,
+      isModels: false
+    };
+  }
+
   // 检查是否是 OpenAI Models 路径
   if (pathname === '/v1/models' || pathname.endsWith('/v1/models')) {
     return {
+      routeType: ROUTE_TYPES.CLAUDE,
       preferredEndpoint: null,
       apiPath: '/v1/models',
       isOpenAI: true,
@@ -437,6 +457,7 @@ function parseRequestPath(url) {
     for (const endpoint of ENDPOINTS) {
       if (pathname.startsWith(endpoint + '/')) {
         return {
+          routeType: ROUTE_TYPES.CLAUDE,
           preferredEndpoint: endpoint,
           apiPath: '/v1/messages',
           isOpenAI: true,
@@ -445,6 +466,7 @@ function parseRequestPath(url) {
       }
     }
     return {
+      routeType: ROUTE_TYPES.CLAUDE,
       preferredEndpoint: null,
       apiPath: '/v1/messages',
       isOpenAI: true,
@@ -457,12 +479,24 @@ function parseRequestPath(url) {
     if (pathname.startsWith(endpoint + '/') || pathname === endpoint) {
       // 提取端点后的 API 路径
       const apiPath = pathname.slice(endpoint.length) || '/';
-      return { preferredEndpoint: endpoint, apiPath, isOpenAI: false, isModels: false };
+      return {
+        routeType: ROUTE_TYPES.CLAUDE,
+        preferredEndpoint: endpoint,
+        apiPath,
+        isOpenAI: false,
+        isModels: false
+      };
     }
   }
 
   // 没有匹配到特定端点，使用默认路由
-  return { preferredEndpoint: null, apiPath: pathname, isOpenAI: false, isModels: false };
+  return {
+    routeType: ROUTE_TYPES.CLAUDE,
+    preferredEndpoint: null,
+    apiPath: pathname,
+    isOpenAI: false,
+    isModels: false
+  };
 }
 
 /**
@@ -486,6 +520,27 @@ async function proxyRequest(request, baseUrlIndex, endpointPath, apiPath) {
   });
 
   return await fetch(proxyRequest);
+}
+
+/**
+ * 代理请求到完整路径（用于 Codex 透传）
+ * @param {Request} request - 原始请求
+ * @param {number} baseUrlIndex - 基础 URL 索引
+ * @param {string} path - 完整路径（例如 /codex/v1/responses）
+ */
+async function proxyDirectRequest(request, baseUrlIndex, path) {
+  const url = new URL(request.url);
+  const targetUrl = `${TARGET_BASE_URLS[baseUrlIndex]}${path}${url.search}`;
+
+  const headers = new Headers(request.headers);
+  const proxiedRequest = new Request(targetUrl, {
+    method: request.method,
+    headers,
+    body: request.body,
+    redirect: 'follow'
+  });
+
+  return await fetch(proxiedRequest);
 }
 
 /**
@@ -519,7 +574,7 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
       // 检查该端点是否至少有一个源可用
       let hasAvailableSource = false;
       for (let baseUrlIndex = 0; baseUrlIndex < TARGET_BASE_URLS.length; baseUrlIndex++) {
-        if (await manager.isAvailable(i, baseUrlIndex)) {
+        if (await manager.isAvailable(i, baseUrlIndex, ROUTE_TYPES.CLAUDE)) {
           hasAvailableSource = true;
           break;
         }
@@ -538,7 +593,7 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
 
         let hasAvailableSource = false;
         for (let baseUrlIndex = 0; baseUrlIndex < TARGET_BASE_URLS.length; baseUrlIndex++) {
-          if (await manager.isAvailable(i, baseUrlIndex)) {
+          if (await manager.isAvailable(i, baseUrlIndex, ROUTE_TYPES.CLAUDE)) {
             hasAvailableSource = true;
             break;
           }
@@ -588,7 +643,7 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
 
         // 如果响应成功（2xx 或 3xx），记录成功并返回
         if (response.status < 400) {
-          await manager.recordSuccess(currentIndex, baseUrlIndex);
+          await manager.recordSuccess(currentIndex, baseUrlIndex, ROUTE_TYPES.CLAUDE);
           return {
             response,
             endpointIndex: currentIndex,
@@ -598,9 +653,9 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
         }
 
         // 如果是 4xx 或 5xx 错误，记录失败并尝试下一个源
-        await manager.recordFailure(currentIndex, baseUrlIndex);
+        await manager.recordFailure(currentIndex, baseUrlIndex, ROUTE_TYPES.CLAUDE);
       } catch (error) {
-        await manager.recordFailure(currentIndex, baseUrlIndex);
+        await manager.recordFailure(currentIndex, baseUrlIndex, ROUTE_TYPES.CLAUDE);
       }
     }
 
@@ -609,6 +664,83 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
 
   // 所有端点的所有源都失败了
   return { response: null, endpointIndex: -1, baseUrlIndex: -1, success: false };
+}
+
+/**
+ * 尝试 Codex 主备源（单端点）
+ * 对 4xx/5xx 也会重试到备源，保持请求/响应透传兼容
+ */
+async function tryCodexSources(request, manager, codexPath) {
+  const requestBody = await request.clone().arrayBuffer();
+  const requestHeaders = new Headers(request.headers);
+  const triedSources = new Set();
+  let lastResponse = null;
+  let lastBaseUrlIndex = -1;
+
+  for (let attempt = 0; attempt < TARGET_BASE_URLS.length; attempt++) {
+    let currentBaseUrlIndex = -1;
+
+    // 优先选择健康可用的源
+    for (let i = 0; i < TARGET_BASE_URLS.length; i++) {
+      if (triedSources.has(i)) continue;
+      if (await manager.isAvailable(0, i, ROUTE_TYPES.CODEX)) {
+        currentBaseUrlIndex = i;
+        break;
+      }
+    }
+
+    // 如果都在冷却期，仍然尝试未试过的源
+    if (currentBaseUrlIndex === -1) {
+      for (let i = 0; i < TARGET_BASE_URLS.length; i++) {
+        if (!triedSources.has(i)) {
+          currentBaseUrlIndex = i;
+          break;
+        }
+      }
+    }
+
+    if (currentBaseUrlIndex === -1) {
+      break;
+    }
+
+    triedSources.add(currentBaseUrlIndex);
+    lastBaseUrlIndex = currentBaseUrlIndex;
+
+    try {
+      const clonedRequest = new Request(request.url, {
+        method: request.method,
+        headers: requestHeaders,
+        body: requestBody.byteLength > 0 ? requestBody : null
+      });
+
+      const response = await proxyDirectRequest(clonedRequest, currentBaseUrlIndex, codexPath);
+      if (response.status < 400) {
+        await manager.recordSuccess(0, currentBaseUrlIndex, ROUTE_TYPES.CODEX);
+        return {
+          response,
+          baseUrlIndex: currentBaseUrlIndex,
+          success: true
+        };
+      }
+
+      lastResponse = response;
+      await manager.recordFailure(0, currentBaseUrlIndex, ROUTE_TYPES.CODEX);
+    } catch (error) {
+      await manager.recordFailure(0, currentBaseUrlIndex, ROUTE_TYPES.CODEX);
+    }
+  }
+
+  return {
+    response: lastResponse,
+    baseUrlIndex: lastBaseUrlIndex,
+    success: false
+  };
+}
+
+function applyCorsHeaders(headers) {
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  headers.set('Access-Control-Allow-Headers', '*');
 }
 
 export default {
@@ -628,7 +760,57 @@ export default {
       }
 
       // 解析请求路径，提取优先端点、API 路径和是否为 OpenAI 格式
-      const { preferredEndpoint, apiPath, isOpenAI, isModels } = parseRequestPath(request.url);
+      const { routeType, preferredEndpoint, apiPath, isOpenAI, isModels } = parseRequestPath(request.url);
+
+      // Codex 透传逻辑：单端点主备源切换 + 4xx/5xx 重试
+      if (routeType === ROUTE_TYPES.CODEX) {
+        const manager = new EndpointHealthManager();
+        const codexResult = await tryCodexSources(request, manager, apiPath);
+
+        if (!codexResult.success) {
+          // 若上游已返回错误响应，则优先透传该错误体，保证 Codex 兼容
+          if (codexResult.response) {
+            const failHeaders = new Headers(codexResult.response.headers);
+            applyCorsHeaders(failHeaders);
+            failHeaders.set('X-Route-Type', ROUTE_TYPES.CODEX);
+            if (codexResult.baseUrlIndex >= 0) {
+              failHeaders.set('X-Used-Base-URL', TARGET_BASE_URLS[codexResult.baseUrlIndex]);
+              failHeaders.set('X-Base-URL-Index', codexResult.baseUrlIndex.toString());
+            }
+
+            return new Response(codexResult.response.body, {
+              status: codexResult.response.status,
+              statusText: codexResult.response.statusText,
+              headers: failHeaders
+            });
+          }
+
+          return new Response(JSON.stringify({
+            error: {
+              message: 'All codex sources failed',
+              type: 'api_error'
+            }
+          }), {
+            status: 503,
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*'
+            }
+          });
+        }
+
+        const codexHeaders = new Headers(codexResult.response.headers);
+        applyCorsHeaders(codexHeaders);
+        codexHeaders.set('X-Route-Type', ROUTE_TYPES.CODEX);
+        codexHeaders.set('X-Used-Base-URL', TARGET_BASE_URLS[codexResult.baseUrlIndex]);
+        codexHeaders.set('X-Base-URL-Index', codexResult.baseUrlIndex.toString());
+
+        return new Response(codexResult.response.body, {
+          status: codexResult.response.status,
+          statusText: codexResult.response.statusText,
+          headers: codexHeaders
+        });
+      }
 
       // 如果是 OpenAI models 接口，直接返回模型列表
       if (isModels) {
@@ -762,11 +944,10 @@ export default {
       }
 
       // 添加 CORS 头
-      responseHeaders.set('Access-Control-Allow-Origin', '*');
-      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-      responseHeaders.set('Access-Control-Allow-Headers', '*');
+      applyCorsHeaders(responseHeaders);
 
       // 添加调试信息头
+      responseHeaders.set('X-Route-Type', ROUTE_TYPES.CLAUDE);
       responseHeaders.set('X-Used-Endpoint', ENDPOINTS[result.endpointIndex]);
       responseHeaders.set('X-Endpoint-Index', result.endpointIndex.toString());
       responseHeaders.set('X-Used-Base-URL', TARGET_BASE_URLS[result.baseUrlIndex]);

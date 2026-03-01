@@ -1,10 +1,13 @@
-# Claude API Smart Router
+# Claude/Codex API Smart Router
 
-智能 Claude API 路由器，在多个 API 端点之间自动切换，优先使用最便宜且可用的端点。
+统一代理 Claude 与 Codex 请求的 Cloudflare Worker：
+- Claude 路由支持多端点按优先级切换（`/v1/messages`、`/v1/chat/completions` 等）
+- Codex 路由支持单端点主备源重试（`/codex/v1`）
+- 对 4xx/5xx 与网络异常自动故障转移，并保持上游接口兼容
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/your-username/cc-router)
 
-**🎁 [获取 API Key](https://foxcode.rjj.cc/auth/register?aff=UI2TST)** - 注册获取 Claude API 访问权限
+**🎁 [获取 API Key](https://foxcode.rjj.cc/auth/register?aff=UI2TST)** - 注册获取 Claude/Codex API 访问权限
 
 **📘 [Claude Code 配置指南](CLAUDE_CODE_SETUP.md)** - 查看如何在 Claude Code CLI 和 VSCode 扩展中使用
 
@@ -15,12 +18,13 @@
 - **OpenAI 兼容接口**: 支持 OpenAI Chat Completions API 格式，自动转换为 Claude API
 - **智能故障转移**: 遇到 4xx/5xx 错误自动切换到下一个端点
 - **双源互备**: 主源 (newcli) 和备源 (dm-fox) 相互备份，单个端点失败时先尝试备源的相同端点
+- **Codex 兼容代理**: 支持 `/codex/v1` 路由透传，单端点下自动主备源切换并对 4xx/5xx 重试
 - **内存状态管理**: 使用全局内存缓存记录端点健康状态（同一实例内共享）
 - **自动冷却**: 连续失败 3 次的端点会被标记为不可用 1 分钟
 - **自动恢复**: 冷却期结束后端点自动恢复可用
 - **零成本**: 完全免费运行
 
-## 快速开始（Claude Code 用户）
+## 快速开始
 
 1. 部署 Worker（见下方部署步骤）
 2. 获取你的 Worker URL：`https://your-worker.workers.dev`（建议绑定自定义域名）
@@ -39,12 +43,13 @@
 }
 ```
 
-4. 开始使用！Worker 会自动选择最便宜的可用端点
+4. 开始使用！Claude 请求会自动选择可用端点，Codex 请求走 `/codex/v1` 主备源重试
 
 **提示**：
-- 默认配置使用自动路由，从最便宜的 droid 端点开始尝试
-- 你也可以指定特定端点，如 `https://your-worker.workers.dev/claude/droid`
-- 详细配置请查看 [Claude Code 配置指南](CLAUDE_CODE_SETUP.md)
+- Claude 默认使用自动路由，从最便宜的 droid 端点开始尝试
+- Codex 统一使用 `https://your-worker.workers.dev/codex/v1/...` 路径
+- 你也可以指定 Claude 特定端点，如 `https://your-worker.workers.dev/claude/droid`
+- Claude Code 详细配置请查看 [Claude Code 配置指南](CLAUDE_CODE_SETUP.md)
 
 ## 部署步骤
 
@@ -82,7 +87,11 @@ wrangler deploy
 
 ## 使用方法
 
-### 方式 1: 自动路由（默认）
+按路由类型使用：
+- Claude：`/v1/messages`、`/v1/chat/completions`、`/claude/*`
+- Codex：`/codex/v1/*`
+
+### Claude 路由：自动路由（默认）
 
 将所有 Claude API 请求发送到你的 Worker URL，Worker 会自动选择最便宜的可用端点：
 
@@ -106,7 +115,7 @@ Worker 会自动：
 3. 继续尝试 `/claude/ultra`、`/claude/super` 和 `/claude`
 4. 记录失败状态，连续失败 3 次后暂时跳过该端点
 
-### 方式 2: 指定端点路由（新功能）
+### Claude 路由：指定端点
 
 通过在路径中指定端点名称，可以优先使用特定端点：
 
@@ -144,7 +153,7 @@ curl https://your-worker.workers.dev/claude/super/v1/messages \
 - `/claude/v1/messages` - 优先使用 claude 端点
 - `/v1/messages` - 自动路由（默认行为）
 
-### 方式 3: OpenAI 兼容接口（新功能）
+### Claude 路由：OpenAI 兼容接口
 
 使用 OpenAI Chat Completions API 格式调用 Claude API，Worker 会自动进行格式转换：
 
@@ -276,15 +285,37 @@ data: [DONE]
 - LlamaIndex
 - 各种 OpenAI 兼容的聊天界面
 
+### Codex 路由：透传代理
+
+Codex 默认上游路由是 `https://code.newcli.com/codex/v1`。通过本 Worker 时，请使用相同路径前缀：
+
+```bash
+curl https://your-worker.workers.dev/codex/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5-codex",
+    "input": "Write a haiku about retries."
+  }'
+```
+
+**行为说明**：
+- 请求和响应都会原样透传，不做 Claude/OpenAI 格式转换
+- 先尝试主源 `https://code.newcli.com`，失败（4xx/5xx 或网络错误）后自动尝试备源 `https://dm-fox.rjj.cc`
+- 当两个源都失败时，优先返回最后一个上游错误响应体，保持 Codex 错误格式兼容
+
 ## 调试
 
 响应头中包含调试信息：
+- `X-Route-Type`: 路由类型（`claude` 或 `codex`）
 - `X-Used-Endpoint`: 实际使用的端点路径
 - `X-Endpoint-Index`: 端点索引（0=droid, 1=aws, 2=ultra, 3=super, 4=claude）
 - `X-Used-Base-URL`: 实际使用的基础 URL（主源或备源）
 - `X-Base-URL-Index`: 基础 URL 索引（0=主源 newcli, 1=备源 dm-fox）
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
 - `X-Format-Conversion`: 如果使用了 OpenAI 格式转换，显示 "OpenAI"
+
+说明：`X-Used-Endpoint`、`X-Endpoint-Index`、`X-Preferred-Endpoint`、`X-Format-Conversion` 主要用于 Claude/OpenAI 路由；Codex 路由重点查看 `X-Route-Type`、`X-Used-Base-URL`、`X-Base-URL-Index`。
 
 查看日志：
 ```bash
@@ -311,6 +342,12 @@ const HEALTH_CHECK_CONFIG = {
 - **持久性**: Worker 重启后状态重置，会自动重新学习端点健康状况
 
 ## 架构说明
+
+路由按路径分流：
+- **Claude/OpenAI 路由**: `/v1/messages`、`/v1/chat/completions`、`/claude/*`，使用多端点策略
+- **Codex 路由**: `/codex/v1/*`，使用单端点主备源重试并透传请求/响应
+
+### Claude/OpenAI 流程
 
 ```
 用户请求
@@ -339,6 +376,25 @@ Cloudflare Worker
 记录成功/失败到内存缓存（每个"端点+源"组合独立追踪）
   ↓
 返回响应（包含调试信息头）
+```
+
+### Codex 流程
+
+```
+用户请求 (/codex/v1/*)
+  ↓
+Cloudflare Worker
+  ↓
+识别为 Codex 路由（不进入 OpenAI/Claude 转换分支）
+  ↓
+优先尝试主源:
+  1. https://code.newcli.com/codex/v1/*
+  ↓ 失败（4xx/5xx 或网络错误）
+尝试备源:
+  2. https://dm-fox.rjj.cc/codex/v1/*
+  ↓
+成功: 透传上游响应（保持 Codex 兼容）
+失败: 返回最后一个上游错误响应（保持原始状态码和响应体）
 ```
 
 ### 备源机制说明
