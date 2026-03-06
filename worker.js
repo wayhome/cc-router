@@ -10,6 +10,7 @@
  * - 支持 OpenAI Completions API 格式兼容
  * - 双源互备：主源 (newcli) 和备源 (dm-fox) 相互备份，单个源失败时自动切换
  * - 支持 Codex 路由透传（/codex/v1），单端点主备源重试
+ * - Claude 全挂时自动切换到 Codex 作为最终备用
  */
 
 // 主源和备源配置
@@ -22,9 +23,7 @@ const TARGET_BASE_URLS = [
 const ENDPOINTS = [
   '/claude/droid',    // 最便宜
   '/claude/aws',
-  '/claude/ultra',
-  '/claude/super',    // 次贵
-  '/claude'           // 最贵
+  '/claude/ultra'
 ];
 
 const CODEX_BASE_PATH = '/codex/v1';
@@ -512,6 +511,11 @@ async function proxyRequest(request, baseUrlIndex, endpointPath, apiPath) {
 
   const headers = new Headers(request.headers);
 
+  // 设置浏览器 User-Agent 避免被拦截
+  if (!headers.has('user-agent') || headers.get('user-agent').includes('curl')) {
+    headers.set('user-agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) CherryStudio/1.7.13 Chrome/140.0.7339.249 Electron/38.7.0 Safari/537.36');
+  }
+
   const proxyRequest = new Request(targetUrl, {
     method: request.method,
     headers: headers,
@@ -533,6 +537,12 @@ async function proxyDirectRequest(request, baseUrlIndex, path) {
   const targetUrl = `${TARGET_BASE_URLS[baseUrlIndex]}${path}${url.search}`;
 
   const headers = new Headers(request.headers);
+
+  // 设置浏览器 User-Agent 避免被拦截
+  if (!headers.has('user-agent') || headers.get('user-agent').includes('curl')) {
+    headers.set('user-agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) CherryStudio/1.7.13 Chrome/140.0.7339.249 Electron/38.7.0 Safari/537.36');
+  }
+
   const proxiedRequest = new Request(targetUrl, {
     method: request.method,
     headers,
@@ -667,6 +677,215 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null)
 }
 
 /**
+ * 转换 Codex Responses API 请求为 Claude Messages API 格式
+ */
+function convertCodexToClaude(codexRequest) {
+  const claudeRequest = {
+    model: 'claude-sonnet-4-5',  // 覆盖为 Claude Code 模型
+    max_tokens: codexRequest.max_tokens || 4096,
+    messages: []
+  };
+
+  // 解析 input 为 messages
+  if (codexRequest.input) {
+    const input = codexRequest.input;
+    const lines = input.split('\n\n');
+
+    for (const line of lines) {
+      if (line.startsWith('User: ')) {
+        claudeRequest.messages.push({
+          role: 'user',
+          content: line.slice(6)
+        });
+      } else if (line.startsWith('Assistant: ')) {
+        claudeRequest.messages.push({
+          role: 'assistant',
+          content: line.slice(11)
+        });
+      } else if (claudeRequest.messages.length === 0) {
+        // 第一行作为 system 或 user
+        claudeRequest.messages.push({
+          role: 'user',
+          content: line
+        });
+      }
+    }
+  }
+
+  if (codexRequest.instructions) {
+    claudeRequest.system = codexRequest.instructions;
+  }
+
+  if (codexRequest.temperature !== undefined) claudeRequest.temperature = codexRequest.temperature;
+  if (codexRequest.stream !== undefined) claudeRequest.stream = codexRequest.stream;
+
+  return claudeRequest;
+}
+
+/**
+ * 转换 Claude Messages API 请求为 Codex Responses API 格式
+ */
+function convertClaudeToCodexRequest(claudeRequest) {
+  const codexRequest = {
+    model: 'gpt-5.3-codex'  // 覆盖为 Codex 模型
+  };
+
+  let inputParts = [];
+  if (claudeRequest.system) inputParts.push(claudeRequest.system);
+
+  if (claudeRequest.messages && Array.isArray(claudeRequest.messages)) {
+    for (const msg of claudeRequest.messages) {
+      const role = msg.role === 'user' ? 'User' : 'Assistant';
+      const content = typeof msg.content === 'string' ? msg.content :
+                     (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join('') : '');
+      inputParts.push(`${role}: ${content}`);
+    }
+  }
+
+  codexRequest.input = inputParts.join('\n\n');
+  if (claudeRequest.max_tokens) codexRequest.max_tokens = claudeRequest.max_tokens;
+  if (claudeRequest.temperature) codexRequest.temperature = claudeRequest.temperature;
+  if (claudeRequest.stream !== undefined) codexRequest.stream = claudeRequest.stream;
+
+  return codexRequest;
+}
+
+/**
+ * 转换 Codex Responses API 响应为 Claude Messages API 格式
+ */
+function convertCodexResponseToClaude(codexResponse) {
+  return {
+    id: codexResponse.id || `msg-${Date.now()}`,
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: codexResponse.output || codexResponse.choices?.[0]?.message?.content || ''
+    }],
+    model: codexResponse.model,
+    stop_reason: 'end_turn',
+    usage: {
+      input_tokens: codexResponse.usage?.prompt_tokens || 0,
+      output_tokens: codexResponse.usage?.completion_tokens || 0
+    }
+  };
+}
+
+/**
+ * 转换 Claude Messages API 响应为 Codex Responses API 格式
+ */
+function convertClaudeResponseToCodex(claudeResponse) {
+  const content = Array.isArray(claudeResponse.content)
+    ? claudeResponse.content.map(c => c.text || '').join('')
+    : claudeResponse.content;
+
+  return {
+    id: claudeResponse.id || `resp-${Date.now()}`,
+    object: 'response',
+    model: claudeResponse.model,
+    output: content,
+    usage: {
+      prompt_tokens: claudeResponse.usage?.input_tokens || 0,
+      completion_tokens: claudeResponse.usage?.output_tokens || 0,
+      total_tokens: (claudeResponse.usage?.input_tokens || 0) + (claudeResponse.usage?.output_tokens || 0)
+    }
+  };
+}
+
+/**
+ * 尝试 Codex 主备源作为 Claude 的备用
+ */
+async function tryCodexAsFallback(request, manager) {
+  try {
+    const claudeBody = await request.clone().json();
+    const codexBody = convertClaudeToCodexRequest(claudeBody);
+    const requestHeaders = new Headers(request.headers);
+    requestHeaders.set('Content-Type', 'application/json');
+
+    for (let baseUrlIndex = 0; baseUrlIndex < TARGET_BASE_URLS.length; baseUrlIndex++) {
+      try {
+        const targetUrl = `${TARGET_BASE_URLS[baseUrlIndex]}/codex/v1/responses`;
+        const codexRequest = new Request(targetUrl, {
+          method: 'POST',
+          headers: requestHeaders,
+          body: JSON.stringify(codexBody)
+        });
+
+        const response = await fetch(codexRequest);
+        if (response.status < 400) {
+          const codexResponse = await response.json();
+          const claudeResponse = convertCodexResponseToClaude(codexResponse);
+
+          return {
+            response: new Response(JSON.stringify(claudeResponse), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' }
+            }),
+            baseUrlIndex,
+            success: true
+          };
+        } else {
+          console.error(`Codex fallback failed for source ${baseUrlIndex}: ${response.status}`);
+        }
+      } catch (error) {
+        console.error(`Codex fallback error for source ${baseUrlIndex}:`, error.message);
+      }
+    }
+  } catch (error) {
+    console.error('Codex fallback error:', error);
+  }
+
+  return { response: null, baseUrlIndex: -1, success: false };
+}
+
+/**
+ * 尝试 Claude 端点作为 Codex 的备用
+ */
+async function tryClaudeAsFallback(request, manager) {
+  try {
+    const codexBody = await request.clone().json();
+    const claudeBody = convertCodexToClaude(codexBody);
+    const requestHeaders = new Headers(request.headers);
+    requestHeaders.set('Content-Type', 'application/json');
+
+    for (let endpointIndex = 0; endpointIndex < ENDPOINTS.length; endpointIndex++) {
+      for (let baseUrlIndex = 0; baseUrlIndex < TARGET_BASE_URLS.length; baseUrlIndex++) {
+        try {
+          const targetUrl = `${TARGET_BASE_URLS[baseUrlIndex]}${ENDPOINTS[endpointIndex]}/v1/messages`;
+          const claudeRequest = new Request(targetUrl, {
+            method: 'POST',
+            headers: requestHeaders,
+            body: JSON.stringify(claudeBody)
+          });
+
+          const response = await fetch(claudeRequest);
+          if (response.status < 400) {
+            const claudeResponse = await response.json();
+            const codexResponse = convertClaudeResponseToCodex(claudeResponse);
+
+            return {
+              response: new Response(JSON.stringify(codexResponse), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+              }),
+              endpointIndex,
+              baseUrlIndex,
+              success: true
+            };
+          }
+        } catch (error) {
+          // 继续尝试下一个源
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Claude fallback error:', error);
+  }
+
+  return { response: null, endpointIndex: -1, baseUrlIndex: -1, success: false };
+}
+
+/**
  * 尝试 Codex 主备源（单端点）
  * 对 4xx/5xx 也会重试到备源，保持请求/响应透传兼容
  */
@@ -762,12 +981,57 @@ export default {
       // 解析请求路径，提取优先端点、API 路径和是否为 OpenAI 格式
       const { routeType, preferredEndpoint, apiPath, isOpenAI, isModels } = parseRequestPath(request.url);
 
+      // 检查是否强制使用 Codex（用于测试）
+      const forceCodex = request.headers.get('x-force-codex') === 'true';
+
       // Codex 透传逻辑：单端点主备源切换 + 4xx/5xx 重试
       if (routeType === ROUTE_TYPES.CODEX) {
         const manager = new EndpointHealthManager();
+
+        // 检查是否强制使用 Claude（用于测试）
+        const forceClaude = request.headers.get('x-force-claude') === 'true';
+
+        if (forceClaude) {
+          // 强制使用 Claude 作为备用
+          const claudeResult = await tryClaudeAsFallback(request, manager);
+
+          if (claudeResult.success) {
+            const claudeHeaders = new Headers(claudeResult.response.headers);
+            applyCorsHeaders(claudeHeaders);
+            claudeHeaders.set('X-Route-Type', 'claude-fallback');
+            claudeHeaders.set('X-Used-Endpoint', ENDPOINTS[claudeResult.endpointIndex]);
+            claudeHeaders.set('X-Used-Base-URL', TARGET_BASE_URLS[claudeResult.baseUrlIndex]);
+            claudeHeaders.set('X-Fallback-Reason', 'forced-by-header');
+
+            return new Response(claudeResult.response.body, {
+              status: claudeResult.response.status,
+              statusText: claudeResult.response.statusText,
+              headers: claudeHeaders
+            });
+          }
+        }
+
         const codexResult = await tryCodexSources(request, manager, apiPath);
 
         if (!codexResult.success) {
+          // Codex 全挂，尝试 Claude 作为备用
+          const claudeResult = await tryClaudeAsFallback(request, manager);
+
+          if (claudeResult.success) {
+            const claudeHeaders = new Headers(claudeResult.response.headers);
+            applyCorsHeaders(claudeHeaders);
+            claudeHeaders.set('X-Route-Type', 'claude-fallback');
+            claudeHeaders.set('X-Used-Endpoint', ENDPOINTS[claudeResult.endpointIndex]);
+            claudeHeaders.set('X-Used-Base-URL', TARGET_BASE_URLS[claudeResult.baseUrlIndex]);
+            claudeHeaders.set('X-Fallback-Reason', 'all-codex-sources-failed');
+
+            return new Response(claudeResult.response.body, {
+              status: claudeResult.response.status,
+              statusText: claudeResult.response.statusText,
+              headers: claudeHeaders
+            });
+          }
+
           // 若上游已返回错误响应，则优先透传该错误体，保证 Codex 兼容
           if (codexResult.response) {
             const failHeaders = new Headers(codexResult.response.headers);
@@ -890,10 +1154,46 @@ export default {
       // 创建健康管理器
       const manager = new EndpointHealthManager();
 
+      // 如果强制使用 Codex（用于测试）
+      if (forceCodex) {
+        const codexResult = await tryCodexAsFallback(processedRequest, manager);
+
+        if (codexResult.success) {
+          const codexHeaders = new Headers(codexResult.response.headers);
+          applyCorsHeaders(codexHeaders);
+          codexHeaders.set('X-Route-Type', 'codex-fallback');
+          codexHeaders.set('X-Used-Base-URL', TARGET_BASE_URLS[codexResult.baseUrlIndex]);
+          codexHeaders.set('X-Fallback-Reason', 'forced-by-header');
+
+          return new Response(codexResult.response.body, {
+            status: codexResult.response.status,
+            statusText: codexResult.response.statusText,
+            headers: codexHeaders
+          });
+        }
+      }
+
       // 尝试所有端点（如果指定了优先端点，先尝试它）
       const result = await tryEndpoints(processedRequest, manager, apiPath, preferredEndpoint);
 
       if (!result.success) {
+        // Claude 全挂，尝试 Codex 作为最终备用
+        const codexResult = await tryCodexAsFallback(processedRequest, manager);
+
+        if (codexResult.success) {
+          const codexHeaders = new Headers(codexResult.response.headers);
+          applyCorsHeaders(codexHeaders);
+          codexHeaders.set('X-Route-Type', 'codex-fallback');
+          codexHeaders.set('X-Used-Base-URL', TARGET_BASE_URLS[codexResult.baseUrlIndex]);
+          codexHeaders.set('X-Fallback-Reason', 'all-claude-endpoints-failed');
+
+          return new Response(codexResult.response.body, {
+            status: codexResult.response.status,
+            statusText: codexResult.response.statusText,
+            headers: codexHeaders
+          });
+        }
+
         const errorBody = isOpenAI
           ? JSON.stringify({
               error: {

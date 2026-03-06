@@ -13,12 +13,13 @@
 
 ## 功能特性
 
-- **价格优先**: 按价格从低到高尝试端点（droid < aws < ultra < super < claude）
+- **价格优先**: 按价格从低到高尝试端点（droid < aws < ultra）
 - **指定端点路由**: 支持通过路径指定优先使用的端点（如 `/claude/aws/v1/messages`）
 - **OpenAI 兼容接口**: 支持 OpenAI Chat Completions API 格式，自动转换为 Claude API
 - **智能故障转移**: 遇到 4xx/5xx 错误自动切换到下一个端点
 - **双源互备**: 主源 (newcli) 和备源 (dm-fox) 相互备份，单个端点失败时先尝试备源的相同端点
 - **Codex 兼容代理**: 支持 `/codex/v1` 路由透传，单端点下自动主备源切换并对 4xx/5xx 重试
+- **跨协议备用**: Claude 全挂时自动切换到 Codex，Codex 全挂时自动切换到 Claude（自动协议转换）
 - **内存状态管理**: 使用全局内存缓存记录端点健康状态（同一实例内共享）
 - **自动冷却**: 连续失败 3 次的端点会被标记为不可用 1 分钟
 - **自动恢复**: 冷却期结束后端点自动恢复可用
@@ -112,8 +113,9 @@ curl https://your-worker.workers.dev/v1/messages \
 Worker 会自动：
 1. 优先尝试最便宜的 `/claude/droid` 端点
 2. 如果失败，自动切换到 `/claude/aws`
-3. 继续尝试 `/claude/ultra`、`/claude/super` 和 `/claude`
-4. 记录失败状态，连续失败 3 次后暂时跳过该端点
+3. 继续尝试 `/claude/ultra`
+4. 所有 Claude 端点都失败时，自动切换到 Codex（协议自动转换）
+5. 记录失败状态，连续失败 3 次后暂时跳过该端点
 
 ### Claude 路由：指定端点
 
@@ -141,16 +143,15 @@ curl https://your-worker.workers.dev/claude/super/v1/messages \
 
 **工作原理**：
 - 首先尝试指定的端点（如 `/claude/aws`）
-- 如果指定端点失败，从该端点位置往后尝试更贵的端点（aws → ultra → super → claude）
+- 如果指定端点失败，从该端点位置往后尝试更贵的端点（aws → ultra）
 - 如果后面的端点都失败，再尝试前面更便宜的端点（droid）
+- 所有 Claude 端点都失败时，自动切换到 Codex 作为最终备用
 - 保持完整的故障转移和健康检查机制
 
 **支持的端点路径**：
 - `/claude/aws/v1/messages` - 优先使用 aws 端点
 - `/claude/droid/v1/messages` - 优先使用 droid 端点
 - `/claude/ultra/v1/messages` - 优先使用 ultra 端点
-- `/claude/super/v1/messages` - 优先使用 super 端点
-- `/claude/v1/messages` - 优先使用 claude 端点
 - `/v1/messages` - 自动路由（默认行为）
 
 ### Claude 路由：OpenAI 兼容接口
@@ -302,18 +303,20 @@ curl https://your-worker.workers.dev/codex/v1/responses \
 **行为说明**：
 - 请求和响应都会原样透传，不做 Claude/OpenAI 格式转换
 - 先尝试主源 `https://code.newcli.com`，失败（4xx/5xx 或网络错误）后自动尝试备源 `https://dm-fox.rjj.cc`
-- 当两个源都失败时，优先返回最后一个上游错误响应体，保持 Codex 错误格式兼容
+- 当两个源都失败时，自动切换到 Claude 端点作为备用（协议自动转换）
+- 如果仍然失败，优先返回最后一个上游错误响应体，保持 Codex 错误格式兼容
 
 ## 调试
 
 响应头中包含调试信息：
-- `X-Route-Type`: 路由类型（`claude` 或 `codex`）
+- `X-Route-Type`: 路由类型（`claude`、`codex`、`codex-fallback`、`claude-fallback`）
 - `X-Used-Endpoint`: 实际使用的端点路径
-- `X-Endpoint-Index`: 端点索引（0=droid, 1=aws, 2=ultra, 3=super, 4=claude）
+- `X-Endpoint-Index`: 端点索引（0=droid, 1=aws, 2=ultra）
 - `X-Used-Base-URL`: 实际使用的基础 URL（主源或备源）
 - `X-Base-URL-Index`: 基础 URL 索引（0=主源 newcli, 1=备源 dm-fox）
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
 - `X-Format-Conversion`: 如果使用了 OpenAI 格式转换，显示 "OpenAI"
+- `X-Fallback-Reason`: 跨协议备用原因（`all-claude-endpoints-failed` 或 `all-codex-sources-failed`）
 
 说明：`X-Used-Endpoint`、`X-Endpoint-Index`、`X-Preferred-Endpoint`、`X-Format-Conversion` 主要用于 Claude/OpenAI 路由；Codex 路由重点查看 `X-Route-Type`、`X-Used-Base-URL`、`X-Base-URL-Index`。
 
@@ -360,18 +363,19 @@ Cloudflare Worker
   ↓
 按优先级顺序尝试端点:
   - 如果指定了优先端点，从该位置开始往后尝试
-    例如指定 ultra: ultra → super → claude → droid → aws
+    例如指定 ultra: ultra → droid → aws
   - 否则按价格顺序尝试:
     1. /claude/droid (最便宜)
     2. /claude/aws
     3. /claude/ultra
-    4. /claude/super
-    5. /claude (最贵)
   ↓
 对于每个端点，依次尝试两个源:
   1. 主源 (code.newcli.com)
   2. 备源 (dm-fox.rjj.cc)
   - 只有两个源都失败才切换到下一个端点
+  ↓
+所有 Claude 端点都失败时:
+  自动切换到 Codex (协议自动转换)
   ↓
 记录成功/失败到内存缓存（每个"端点+源"组合独立追踪）
   ↓
@@ -392,9 +396,12 @@ Cloudflare Worker
   ↓ 失败（4xx/5xx 或网络错误）
 尝试备源:
   2. https://dm-fox.rjj.cc/codex/v1/*
+  ↓ 两个源都失败
+自动切换到 Claude 端点 (协议自动转换):
+  3. 尝试所有 Claude 端点 (droid → aws → ultra)
   ↓
-成功: 透传上游响应（保持 Codex 兼容）
-失败: 返回最后一个上游错误响应（保持原始状态码和响应体）
+成功: 透传响应（Codex 格式或转换后的 Codex 格式）
+失败: 返回最后一个上游错误响应
 ```
 
 ### 备源机制说明
