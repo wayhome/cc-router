@@ -198,8 +198,44 @@ function convertOpenAIToClaude(openaiRequest) {
             content: msg.content
           });
         }
+        // 处理 assistant 的 tool_calls
+        if (msg.role === 'assistant' && msg.tool_calls && Array.isArray(msg.tool_calls)) {
+          const toolUseContent = msg.tool_calls.map(tc => ({
+            type: 'tool_use',
+            id: tc.id,
+            name: tc.function.name,
+            input: typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments
+          }));
+          if (claudeRequest.messages.length > 0) {
+            const lastMsg = claudeRequest.messages[claudeRequest.messages.length - 1];
+            if (Array.isArray(lastMsg.content)) {
+              lastMsg.content.push(...toolUseContent);
+            } else {
+              lastMsg.content = [{ type: 'text', text: lastMsg.content }, ...toolUseContent];
+            }
+          }
+        }
+      } else if (msg.role === 'tool') {
+        // 转换 tool 消息为 tool_result
+        claudeRequest.messages.push({
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: msg.tool_call_id,
+            content: msg.content
+          }]
+        });
       }
     }
+  }
+
+  // 转换 tools 为 Claude 格式
+  if (openaiRequest.tools && Array.isArray(openaiRequest.tools)) {
+    claudeRequest.tools = openaiRequest.tools.map(tool => ({
+      name: tool.function.name,
+      description: tool.function.description,
+      input_schema: tool.function.parameters
+    }));
   }
 
   // 可选参数转换 - 只添加有效的参数
@@ -241,6 +277,7 @@ async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
   return new ReadableStream({
     async start(controller) {
       let buffer = '';
+      let toolCallIndex = 0;
 
       try {
         while (true) {
@@ -270,7 +307,6 @@ async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
                 const claudeEvent = JSON.parse(data);
                 let openaiEvent = null;
 
-                // 转换不同类型的 Claude 事件为 OpenAI 格式
                 switch (claudeEvent.type) {
                   case 'message_start':
                     openaiEvent = {
@@ -287,8 +323,29 @@ async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
                     break;
 
                   case 'content_block_start':
-                    // OpenAI 在第一个 chunk 中已经包含了 role，这里跳过
-                    continue;
+                    if (claudeEvent.content_block?.type === 'tool_use') {
+                      openaiEvent = {
+                        id: `chatcmpl-${Date.now()}`,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: originalModel || 'claude-3-5-sonnet-20241022',
+                        choices: [{
+                          index: 0,
+                          delta: {
+                            tool_calls: [{
+                              index: toolCallIndex++,
+                              id: claudeEvent.content_block.id,
+                              type: 'function',
+                              function: { name: claudeEvent.content_block.name, arguments: '' }
+                            }]
+                          },
+                          finish_reason: null
+                        }]
+                      };
+                    } else {
+                      continue;
+                    }
+                    break;
 
                   case 'content_block_delta':
                     if (claudeEvent.delta?.type === 'text_delta') {
@@ -303,18 +360,34 @@ async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
                           finish_reason: null
                         }]
                       };
+                    } else if (claudeEvent.delta?.type === 'input_json_delta') {
+                      openaiEvent = {
+                        id: `chatcmpl-${Date.now()}`,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: originalModel || 'claude-3-5-sonnet-20241022',
+                        choices: [{
+                          index: 0,
+                          delta: {
+                            tool_calls: [{
+                              index: toolCallIndex - 1,
+                              function: { arguments: claudeEvent.delta.partial_json }
+                            }]
+                          },
+                          finish_reason: null
+                        }]
+                      };
                     }
                     break;
 
                   case 'content_block_stop':
-                    // 内容块结束，不需要发送事件
                     continue;
 
                   case 'message_delta':
-                    // 处理 stop_reason
                     if (claudeEvent.delta?.stop_reason) {
                       const finishReason = claudeEvent.delta.stop_reason === 'end_turn' ? 'stop' :
                                          claudeEvent.delta.stop_reason === 'max_tokens' ? 'length' :
+                                         claudeEvent.delta.stop_reason === 'tool_use' ? 'tool_calls' :
                                          claudeEvent.delta.stop_reason;
                       openaiEvent = {
                         id: `chatcmpl-${Date.now()}`,
@@ -375,6 +448,31 @@ async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
  * 转换 Claude Messages API 响应格式为 OpenAI Chat Completions 格式
  */
 function convertClaudeToOpenAI(claudeResponse, model) {
+  const message = { role: 'assistant', content: '' };
+  const toolCalls = [];
+
+  // 处理 content 数组
+  if (claudeResponse.content && Array.isArray(claudeResponse.content)) {
+    for (const block of claudeResponse.content) {
+      if (block.type === 'text') {
+        message.content += block.text;
+      } else if (block.type === 'tool_use') {
+        toolCalls.push({
+          id: block.id,
+          type: 'function',
+          function: {
+            name: block.name,
+            arguments: JSON.stringify(block.input)
+          }
+        });
+      }
+    }
+  }
+
+  if (toolCalls.length > 0) {
+    message.tool_calls = toolCalls;
+  }
+
   return {
     id: claudeResponse.id || `chatcmpl-${Date.now()}`,
     object: 'chat.completion',
@@ -383,12 +481,10 @@ function convertClaudeToOpenAI(claudeResponse, model) {
     choices: [
       {
         index: 0,
-        message: {
-          role: 'assistant',
-          content: claudeResponse.content?.[0]?.text || ''
-        },
+        message,
         finish_reason: claudeResponse.stop_reason === 'end_turn' ? 'stop' :
                       claudeResponse.stop_reason === 'max_tokens' ? 'length' :
+                      claudeResponse.stop_reason === 'tool_use' ? 'tool_calls' :
                       claudeResponse.stop_reason || 'stop'
       }
     ],
