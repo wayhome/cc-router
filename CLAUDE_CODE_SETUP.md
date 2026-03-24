@@ -67,6 +67,46 @@ export ANTHROPIC_BASE_URL=https://your-worker.workers.dev
 export ANTHROPIC_API_KEY=your-api-key
 ```
 
+## 端点配置模板（可直接复制）
+
+### 1) 默认省钱模式（推荐）
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "your-api-key",
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev"
+  }
+}
+```
+
+行为：`droid -> aws`，不会自动升到 `ultra/super/claude`。
+
+### 2) 固定从指定端点开始
+
+把 `ANTHROPIC_BASE_URL` 改成以下之一：
+
+- `https://your-worker.workers.dev/claude/droid`（`droid -> aws`）
+- `https://your-worker.workers.dev/claude/aws`（`aws -> droid`）
+- `https://your-worker.workers.dev/claude/ultra`（`ultra -> droid -> aws`）
+- `https://your-worker.workers.dev/claude/super`（`super -> droid -> aws -> ultra`）
+- `https://your-worker.workers.dev/claude`（`claude -> droid -> aws -> ultra -> super`）
+
+### 3) 允许更高等级端点（按需开启）
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "your-api-key",
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev",
+    "ANTHROPIC_CUSTOM_HEADERS": "x-ccr-tier: true"
+  }
+}
+```
+
+说明：开启后会允许继续尝试更高等级端点。  
+`ANTHROPIC_CUSTOM_HEADERS` 格式：`"Header1: value1\nHeader2: value2"`。
+
 ## 验证配置
 
 测试连接：
@@ -101,34 +141,6 @@ curl https://your-worker.workers.dev/claude/aws/v1/messages \
 查看响应头中的调试信息：
 - `X-Used-Endpoint`: 实际使用的端点
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
-
-## 工作原理
-
-```
-Claude Code CLI/VSCode
-        ↓
-  Your Cloudflare Worker
-        ↓
-解析请求路径，提取优先端点
-        ↓
-智能路由:
-  - 如果指定了优先端点，优先从该端点开始
-  - 默认只会尝试当前价格层级及以下端点（不会自动升到更高等级）
-  - 若开启自定义 header，可允许继续尝试更高等级端点
-  - 否则按价格从低到高尝试:
-    1. code.newcli.com/claude/droid
-    2. code.newcli.com/claude/aws
-    3. code.newcli.com/claude/ultra
-    4. code.newcli.com/claude/super
-    5. code.newcli.com/claude
-```
-
-Worker 会：
-1. 接收来自 Claude Code 的请求
-2. 解析路径，识别是否指定了优先端点
-3. 默认仅在当前价格层级及以下尝试；只有显式开启时才向更高等级降级
-4. 透明转发请求和响应
-5. 遇到错误时自动切换到下一个端点
 
 ## 使用指定端点路由（高级功能）
 
@@ -176,14 +188,7 @@ Worker 会：
 - `https://your-worker.workers.dev/claude` - 优先使用 claude 端点（最贵）
 - `https://your-worker.workers.dev` - 自动路由（默认，推荐）
 
-### 使用场景
-
-1. **测试特定端点**: 当你想测试某个端点的性能或可用性时
-2. **成本控制**: 强制使用最便宜的端点
-3. **性能优化**: 如果你发现某个端点在你的地区速度更快
-4. **调试问题**: 排查特定端点的问题
-
-**注意**: 大多数情况下，使用默认的自动路由即可，Worker 会自动选择最优端点。
+多数场景下建议直接使用默认自动路由。
 
 ## 监控和调试
 
@@ -201,15 +206,7 @@ Worker 会：
 wrangler tail
 ```
 
-### 查看端点健康状态
-
-端点健康状态存储在 Worker 实例的内存中，可以通过日志观察：
-
-```bash
-wrangler tail
-```
-
-日志会显示端点进入/退出冷却期的信息。
+端点健康状态在 Worker 内存中维护，可通过日志观察进入/退出冷却期。
 
 ## 高级配置
 
@@ -224,25 +221,7 @@ const HEALTH_CHECK_CONFIG = {
 };
 ```
 
-### 调整端点优先级
-
-修改 ENDPOINTS 数组的顺序：
-
-```javascript
-const ENDPOINTS = [
-  '/claude/aws',      // 最优先
-  '/claude/droid',
-  '/claude/ultra',
-  '/claude/super',
-  '/claude'           // 最后尝试（最高等级）
-];
-```
-
 ## 常见问题
-
-### Q: 为什么有时候会使用较贵的端点？
-
-A: 仅当你开启了 `x-ccr-tier: true`（通过 `ANTHROPIC_CUSTOM_HEADERS` 注入）时，才会在低价端点失败后继续尝试较贵端点。默认不会自动升级到更高等级。
 
 ### Q: 如何重置端点状态？
 
@@ -252,34 +231,12 @@ A: 重新部署 Worker 或等待 Worker 实例重启即可重置状态。健康�
 
 A: 完全支持！Worker 会透传 Server-Sent Events (SSE) 流式响应，Claude Code 的流式输出完全正常。
 
-## 性能优化
+## 路由规则（简版）
 
-### 使用自定义域名
-
-为 Worker 配置自定义域名可以提升性能：
-
-1. 在 Cloudflare Dashboard 中添加自定义域名
-2. 更新 Claude Code 配置使用自定义域名
-
-### 启用缓存
-
-对于不变的请求（如模型列表），可以添加缓存：
-
-```javascript
-// 在 worker.js 的 fetch 函数中添加
-if (url.pathname === '/v1/models') {
-  // 缓存模型列表 1 小时
-  ctx.waitUntil(cacheResponse(request, response));
-}
-```
-
-## 费用估算
-
-Cloudflare Workers 免费额度：
-- 100,000 次请求/天
-
-对于个人使用，免费额度通常足够。如果超出：
-- Workers: $5/月，包含 1000 万次请求
+1. 默认从低价层级（droid/aws）开始，且不自动升到更高层级
+2. 设置 `x-ccr-tier: true` 后，才允许尝试 `ultra/super/claude`
+3. 指定端点时先尝试该端点，再按规则继续
+4. 每个端点先主源再备源，两个源都失败才换下一个端点
 
 ## 安全建议
 

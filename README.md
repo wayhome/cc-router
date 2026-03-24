@@ -130,6 +130,22 @@ Worker 会自动：
 `ANTHROPIC_CUSTOM_HEADERS` 格式为多行 `Header: value`：
 `"Header1: value1\nHeader2: value2"`
 
+### Claude 端点配置速查
+
+下表中的“尝试顺序”表示 **默认不加** `x-ccr-tier: true` 时的行为：
+
+| 场景 | `ANTHROPIC_BASE_URL` | `ANTHROPIC_CUSTOM_HEADERS` | 默认尝试顺序 |
+|---|---|---|---|
+| 最省钱（推荐默认） | `https://your-worker.workers.dev` | 不设置 | `droid -> aws` |
+| 固定从 droid 开始 | `https://your-worker.workers.dev/claude/droid` | 不设置 | `droid -> aws` |
+| 固定从 aws 开始 | `https://your-worker.workers.dev/claude/aws` | 不设置 | `aws -> droid` |
+| 固定从 ultra 开始 | `https://your-worker.workers.dev/claude/ultra` | 不设置 | `ultra -> droid -> aws` |
+| 固定从 super 开始 | `https://your-worker.workers.dev/claude/super` | 不设置 | `super -> droid -> aws -> ultra` |
+| 固定从 claude 开始 | `https://your-worker.workers.dev/claude` | 不设置 | `claude -> droid -> aws -> ultra -> super` |
+
+如果要允许走更高等级端点，在 `ANTHROPIC_CUSTOM_HEADERS` 加：
+`x-ccr-tier: true`
+
 ### Claude 路由：指定端点
 
 通过在路径中指定端点名称，可以优先使用特定端点：
@@ -153,13 +169,6 @@ curl https://your-worker.workers.dev/claude/super/v1/messages \
   -H "x-api-key: your-api-key" \
   ...
 ```
-
-**工作原理**：
-- 首先尝试指定的端点（如 `/claude/aws`）
-- 默认只在“当前价格层级及以下”尝试（不会自动升到更高等级）
-- 当 `x-ccr-tier: true` 时，才会按顺序尝试更贵端点
-- 所有 Claude 端点都失败时，自动切换到 Codex 作为最终备用
-- 保持完整的故障转移和健康检查机制
 
 **支持的端点路径**：
 - `/claude/aws/v1/messages` - 优先使用 aws 端点
@@ -240,66 +249,9 @@ curl https://your-worker.workers.dev/v1/models \
 }
 ```
 
-**响应格式对比**：
-
-OpenAI 格式响应：
-```json
-{
-  "id": "chatcmpl-123",
-  "object": "chat.completion",
-  "created": 1677652288,
-  "model": "claude-3-5-sonnet-20241022",
-  "choices": [{
-    "index": 0,
-    "message": {
-      "role": "assistant",
-      "content": "Hello! How can I assist you today?"
-    },
-    "finish_reason": "stop"
-  }],
-  "usage": {
-    "prompt_tokens": 20,
-    "completion_tokens": 10,
-    "total_tokens": 30
-  }
-}
-```
-
-Claude 原生格式响应（使用 `/v1/messages`）：
-```json
-{
-  "id": "msg_123",
-  "type": "message",
-  "role": "assistant",
-  "content": [{"type": "text", "text": "Hello! How can I assist you today?"}],
-  "stop_reason": "end_turn",
-  "usage": {"input_tokens": 20, "output_tokens": 10}
-}
-```
-
-**流式响应说明**：
-
-Worker 会自动将 Claude 的 Server-Sent Events (SSE) 格式转换为 OpenAI 的 SSE 格式：
-
-Claude SSE 事件：
-```
-data: {"type":"message_start","message":{"id":"msg_123","role":"assistant"}}
-data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}
-data: {"type":"message_stop"}
-```
-
-转换为 OpenAI SSE 格式：
-```
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
-data: [DONE]
-```
-
-这使得任何支持 OpenAI API 的客户端都可以无缝使用 Claude API，包括：
-- 官方 OpenAI SDK
-- LangChain
-- LlamaIndex
-- 各种 OpenAI 兼容的聊天界面
+**说明**：
+- 非流式和流式响应都会自动转换为 OpenAI 兼容格式（含 SSE）
+- 建议直接用 OpenAI SDK/LangChain/LlamaIndex 按 OpenAI 方式接入
 
 ### Codex 路由：透传代理
 
@@ -360,94 +312,13 @@ const HEALTH_CHECK_CONFIG = {
 - **性能**: 内存访问，零延迟
 - **持久性**: Worker 重启后状态重置，会自动重新学习端点健康状况
 
-## 架构说明
+## 路由摘要
 
-路由按路径分流：
-- **Claude/OpenAI 路由**: `/v1/messages`、`/v1/chat/completions`、`/claude/*`，使用多端点策略
-- **Codex 路由**: `/codex/v1/*`，使用单端点主备源重试并透传请求/响应
-
-### Claude/OpenAI 流程
-
-```
-用户请求
-  ↓
-Cloudflare Worker
-  ↓
-解析请求路径，提取优先端点
-  ↓
-检查内存缓存中的端点健康状态
-  ↓
-按优先级顺序尝试端点:
-  - 默认只尝试当前价格层级及以下端点（不自动升高）
-  - 设置 `x-ccr-tier: true` 后，才会继续尝试更高层级
-  - 价格层级: droid = aws < ultra < super < claude
-  ↓
-对于每个端点，依次尝试两个源:
-  1. 主源 (code.newcli.com)
-  2. 备源 (dm-fox.rjj.cc)
-  - 只有两个源都失败才切换到下一个端点
-  ↓
-所有 Claude 端点都失败时:
-  自动切换到 Codex (协议自动转换)
-  ↓
-记录成功/失败到内存缓存（每个"端点+源"组合独立追踪）
-  ↓
-返回响应（包含调试信息头）
-```
-
-### Codex 流程
-
-```
-用户请求 (/codex/v1/*)
-  ↓
-Cloudflare Worker
-  ↓
-识别为 Codex 路由（不进入 OpenAI/Claude 转换分支）
-  ↓
-优先尝试主源:
-  1. https://code.newcli.com/codex/v1/*
-  ↓ 失败（4xx/5xx 或网络错误）
-尝试备源:
-  2. https://dm-fox.rjj.cc/codex/v1/*
-  ↓ 两个源都失败
-自动切换到 Claude 端点 (协议自动转换):
-  3. 尝试所有 Claude 端点 (droid → aws → ultra → super → claude)
-  ↓
-成功: 透传响应（Codex 格式或转换后的 Codex 格式）
-失败: 返回最后一个上游错误响应
-```
-
-### 备源机制说明
-
-Worker 为每个端点配置了主源和备源，提供高可用性：
-
-- **主源**: `https://code.newcli.com` - 默认优先使用
-- **备源**: `https://dm-fox.rjj.cc` - 主源失败时自动切换
-
-**切换逻辑**：
-1. 尝试某个端点时，先尝试主源
-2. 如果主源失败（4xx/5xx 或网络错误），立即尝试备源的相同端点
-3. 只有两个源都失败后，才切换到下一个端点
-4. 每个"端点+源"组合独立追踪健康状态
-
-**示例**：
-```
-请求 /claude/aws/v1/messages
-  ↓
-尝试: code.newcli.com/claude/aws/v1/messages (失败)
-  ↓
-尝试: dm-fox.rjj.cc/claude/aws/v1/messages (成功) ✓
-  ↓
-返回响应，响应头显示:
-  X-Used-Endpoint: /claude/aws
-  X-Used-Base-URL: https://dm-fox.rjj.cc
-  X-Base-URL-Index: 1
-```
-
-这种设计确保了：
-- 优先使用价格最低的端点
-- 单个源故障不会导致服务中断
-- 最大化可用性和成本效益
+- Claude/OpenAI 路由：`/v1/messages`、`/v1/chat/completions`、`/claude/*`
+- Codex 路由：`/codex/v1/*`
+- Claude 默认只尝试当前价格层级及以下，设置 `x-ccr-tier: true` 才允许更高层级
+- 每个端点先试主源 `code.newcli.com`，再试备源 `dm-fox.rjj.cc`
+- Claude 全挂自动切 Codex；Codex 全挂自动切 Claude（协议自动转换）
 
 ## License
 
