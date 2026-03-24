@@ -29,7 +29,7 @@
 - 使用 `ANTHROPIC_AUTH_TOKEN` 而不是 `apiKey`
 - 使用 `ANTHROPIC_BASE_URL` 而不是 `apiUrl`
 - 配置文件位置是 `~/.claude/settings.json`
-- 默认配置使用自动路由，Worker 会从最便宜的 droid 端点开始尝试
+- 默认配置使用自动路由，Worker 会从最低价层级（droid/aws）开始尝试，且默认不自动升级到更高等级端点
 
 **高级配置**：你也可以指定特定端点作为基础 URL：
 
@@ -42,7 +42,7 @@
 }
 ```
 
-这样配置后，所有请求都会优先使用 droid 端点，失败时从 droid 位置往后尝试（aws → ultra → super → claude）。
+这样配置后，所有请求都会优先使用 droid 端点；默认只会在同层级内尝试（droid/aws）。
 
 #### VSCode 扩展配置
 
@@ -112,8 +112,9 @@ Claude Code CLI/VSCode
 解析请求路径，提取优先端点
         ↓
 智能路由:
-  - 如果指定了优先端点，从该位置开始往后尝试
-    例如指定 aws: aws → ultra → super → claude → droid
+  - 如果指定了优先端点，优先从该端点开始
+  - 默认只会尝试当前价格层级及以下端点（不会自动升到更高等级）
+  - 若开启自定义 header，可允许继续尝试更高等级端点
   - 否则按价格从低到高尝试:
     1. code.newcli.com/claude/droid
     2. code.newcli.com/claude/aws
@@ -125,7 +126,7 @@ Claude Code CLI/VSCode
 Worker 会：
 1. 接收来自 Claude Code 的请求
 2. 解析路径，识别是否指定了优先端点
-3. 如果指定了优先端点，从该位置往后尝试；否则从最便宜的端点开始
+3. 默认仅在当前价格层级及以下尝试；只有显式开启时才向更高等级降级
 4. 透明转发请求和响应
 5. 遇到错误时自动切换到下一个端点
 
@@ -146,7 +147,25 @@ Worker 会：
 }
 ```
 
-这样配置后，所有请求都会优先使用 aws 端点，失败时从 aws 位置往后尝试（ultra → super → claude），最后才尝试更便宜的 droid 端点。
+这样配置后，所有请求都会优先使用 aws 端点；默认只会在同层级（aws/droid）内切换。
+
+### 通过 ANTHROPIC_CUSTOM_HEADERS 控制是否允许更高等级降级
+
+默认情况下，Worker 不会自动降级到更高等级端点（`ultra/super/claude`）。  
+如需开启，请在 Claude Code 中设置：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "your-api-key",
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev",
+    "ANTHROPIC_CUSTOM_HEADERS": "x-ccr-tier: true"
+  }
+}
+```
+
+该配置会注入 `x-ccr-tier: true`，Worker 才会继续尝试更高等级端点。
+`ANTHROPIC_CUSTOM_HEADERS` 支持多行格式：`"Header1: value1\nHeader2: value2"`。
 
 ### 支持的端点路径
 
@@ -174,6 +193,7 @@ Worker 会：
 - `X-Used-Endpoint`: 实际使用的端点路径
 - `X-Endpoint-Index`: 端点索引（0=droid, 1=aws, 2=ultra, 3=super, 4=claude）
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
+- `X-Allow-Higher-Tier-Fallback`: 是否允许向更高等级端点降级（`true/false`）
 
 ### 查看 Worker 日志
 
@@ -213,7 +233,8 @@ const ENDPOINTS = [
   '/claude/aws',      // 最优先
   '/claude/droid',
   '/claude/ultra',
-  '/claude'           // 最后尝试
+  '/claude/super',
+  '/claude'           // 最后尝试（最高等级）
 ];
 ```
 
@@ -221,7 +242,7 @@ const ENDPOINTS = [
 
 ### Q: 为什么有时候会使用较贵的端点？
 
-A: 如果便宜的端点连续失败 3 次，会进入 1 分钟冷却期，期间会自动使用下一个可用端点。
+A: 仅当你开启了 `x-ccr-tier: true`（通过 `ANTHROPIC_CUSTOM_HEADERS` 注入）时，才会在低价端点失败后继续尝试较贵端点。默认不会自动升级到更高等级。
 
 ### Q: 如何重置端点状态？
 

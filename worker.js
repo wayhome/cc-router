@@ -2,7 +2,7 @@
  * Cloudflare Worker - Claude API Smart Router
  *
  * 智能路由，在多个 Claude API 端点之间自动切换
- * - 按价格从低到高排序（aws < droid < ultra < claude）
+ * - 按价格从低到高排序（droid = aws < ultra < super < claude）
  * - 使用全局内存缓存记录端点健康状态（同一实例内共享）
  * - 自动故障转移，优先使用最便宜的可用端点
  * - 失败的端点会被临时标记，一段时间后重新尝试
@@ -23,8 +23,22 @@ const TARGET_BASE_URLS = [
 const ENDPOINTS = [
   '/claude/droid',    // 最便宜
   '/claude/aws',
-  '/claude/ultra'
+  '/claude/ultra',
+  '/claude/super',
+  '/claude'           // 最贵
 ];
+
+// 端点价格层级（droid = aws < ultra < super < claude）
+const ENDPOINT_TIERS = {
+  '/claude/droid': 0,
+  '/claude/aws': 0,
+  '/claude/ultra': 1,
+  '/claude/super': 2,
+  '/claude': 3
+};
+
+// 通过 ANTHROPIC_CUSTOM_HEADERS 注入此 header 可允许向更高等级端点降级
+const ALLOW_HIGHER_TIER_FALLBACK_HEADER = 'x-ccr-tier';
 
 const CODEX_BASE_PATH = '/codex/v1';
 const ROUTE_TYPES = {
@@ -651,81 +665,49 @@ async function proxyDirectRequest(request, baseUrlIndex, path) {
 
 /**
  * 尝试所有端点，直到成功或全部失败
- * 如果指定了 preferredEndpoint，优先使用该端点，失败后从该位置往后尝试
- * 否则按价格从低到高尝试
+ * 如果指定了 preferredEndpoint，优先使用该端点，失败后按顺序尝试
+ * 默认不会自动升级到更高价格层级（可通过自定义 header 开启）
  * 对于每个端点，会先尝试主源，失败后尝试备源，两个源都失败才切换到下一个端点
  */
-async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null) {
+async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null, allowHigherTierFallback = false) {
   const requestBody = await request.clone().arrayBuffer();
   const requestHeaders = new Headers(request.headers);  // 保存请求头
   const triedEndpoints = new Set();  // 记录已尝试的端点（不含源信息）
+  const candidateEndpointIndices = buildEndpointAttemptOrder(preferredEndpoint, allowHigherTierFallback);
 
-  // 如果指定了优先端点，确定起始位置
-  let startIndex = 0;
-  if (preferredEndpoint) {
-    const preferredIndex = ENDPOINTS.indexOf(preferredEndpoint);
-    if (preferredIndex !== -1) {
-      startIndex = preferredIndex;
-    }
+  if (candidateEndpointIndices.length === 0) {
+    return { response: null, endpointIndex: -1, baseUrlIndex: -1, success: false };
   }
 
-  // 按优先级顺序尝试所有端点
-  for (let attempt = 0; attempt < ENDPOINTS.length; attempt++) {
+  // 按优先级顺序尝试所有候选端点
+  for (let attempt = 0; attempt < candidateEndpointIndices.length; attempt++) {
     let currentIndex = -1;
 
-    // 从起始位置开始，按顺序查找下一个可用端点（至少一个源可用）
-    for (let i = startIndex; i < ENDPOINTS.length; i++) {
-      if (triedEndpoints.has(i)) continue;
+    // 按候选顺序查找下一个可用端点（至少一个源可用）
+    for (const endpointIndex of candidateEndpointIndices) {
+      if (triedEndpoints.has(endpointIndex)) continue;
 
       // 检查该端点是否至少有一个源可用
       let hasAvailableSource = false;
       for (let baseUrlIndex = 0; baseUrlIndex < TARGET_BASE_URLS.length; baseUrlIndex++) {
-        if (await manager.isAvailable(i, baseUrlIndex, ROUTE_TYPES.CLAUDE)) {
+        if (await manager.isAvailable(endpointIndex, baseUrlIndex, ROUTE_TYPES.CLAUDE)) {
           hasAvailableSource = true;
           break;
         }
       }
 
       if (hasAvailableSource) {
-        currentIndex = i;
+        currentIndex = endpointIndex;
         break;
       }
     }
 
-    // 如果从起始位置往后没找到，尝试起始位置之前的端点
-    if (currentIndex === -1 && startIndex > 0) {
-      for (let i = 0; i < startIndex; i++) {
-        if (triedEndpoints.has(i)) continue;
-
-        let hasAvailableSource = false;
-        for (let baseUrlIndex = 0; baseUrlIndex < TARGET_BASE_URLS.length; baseUrlIndex++) {
-          if (await manager.isAvailable(i, baseUrlIndex, ROUTE_TYPES.CLAUDE)) {
-            hasAvailableSource = true;
-            break;
-          }
-        }
-
-        if (hasAvailableSource) {
-          currentIndex = i;
-          break;
-        }
-      }
-    }
-
-    // 如果还是没有可用端点，尝试任何未尝试的端点（包括冷却期的）
+    // 如果都在冷却期，仍然尝试未试过的候选端点
     if (currentIndex === -1) {
-      for (let i = startIndex; i < ENDPOINTS.length; i++) {
-        if (!triedEndpoints.has(i)) {
-          currentIndex = i;
+      for (const endpointIndex of candidateEndpointIndices) {
+        if (!triedEndpoints.has(endpointIndex)) {
+          currentIndex = endpointIndex;
           break;
-        }
-      }
-      if (currentIndex === -1 && startIndex > 0) {
-        for (let i = 0; i < startIndex; i++) {
-          if (!triedEndpoints.has(i)) {
-            currentIndex = i;
-            break;
-          }
         }
       }
     }
@@ -1058,6 +1040,85 @@ function applyCorsHeaders(headers) {
   headers.set('Access-Control-Allow-Headers', '*');
 }
 
+function getEndpointTier(endpoint) {
+  if (Object.prototype.hasOwnProperty.call(ENDPOINT_TIERS, endpoint)) {
+    return ENDPOINT_TIERS[endpoint];
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
+
+function parseBooleanHeader(value) {
+  if (value === null || value === undefined) return false;
+  const normalized = String(value).trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
+function parseCustomHeaderLines(rawValue) {
+  if (!rawValue) return new Map();
+
+  const normalized = String(rawValue).replace(/\\n/g, '\n');
+  const lines = normalized.split(/\r?\n/);
+  const parsed = new Map();
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    const colonIndex = trimmed.indexOf(':');
+    if (colonIndex === -1) continue;
+
+    const key = trimmed.slice(0, colonIndex).trim().toLowerCase();
+    const value = trimmed.slice(colonIndex + 1).trim();
+    if (!key) continue;
+
+    parsed.set(key, value);
+  }
+
+  return parsed;
+}
+
+function shouldAllowHigherTierFallback(headers) {
+  const explicit = headers.get(ALLOW_HIGHER_TIER_FALLBACK_HEADER);
+  if (explicit !== null) {
+    return parseBooleanHeader(explicit);
+  }
+
+  // 兼容客户端传递 anthropic-custom-headers 字符串:
+  // "Header1: value1\nHeader2: value2"
+  const customHeadersRaw = headers.get('anthropic-custom-headers');
+  if (!customHeadersRaw) return false;
+
+  const customHeaders = parseCustomHeaderLines(customHeadersRaw);
+  if (customHeaders.has(ALLOW_HIGHER_TIER_FALLBACK_HEADER)) {
+    return parseBooleanHeader(customHeaders.get(ALLOW_HIGHER_TIER_FALLBACK_HEADER));
+  }
+
+  return false;
+}
+
+function buildEndpointAttemptOrder(preferredEndpoint, allowHigherTierFallback) {
+  let startIndex = 0;
+  if (preferredEndpoint) {
+    const preferredIndex = ENDPOINTS.indexOf(preferredEndpoint);
+    if (preferredIndex !== -1) {
+      startIndex = preferredIndex;
+    }
+  }
+
+  const preferredTier = getEndpointTier(preferredEndpoint || ENDPOINTS[startIndex]);
+  const maxAllowedTier = allowHigherTierFallback ? Number.POSITIVE_INFINITY : preferredTier;
+
+  const orderedIndices = [];
+  for (let i = startIndex; i < ENDPOINTS.length; i++) {
+    orderedIndices.push(i);
+  }
+  for (let i = 0; i < startIndex; i++) {
+    orderedIndices.push(i);
+  }
+
+  return orderedIndices.filter(index => getEndpointTier(ENDPOINTS[index]) <= maxAllowedTier);
+}
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -1269,8 +1330,17 @@ export default {
         }
       }
 
+      // 默认不升级到更高价格层级；可通过自定义 header 开启
+      const allowHigherTierFallback = shouldAllowHigherTierFallback(processedRequest.headers);
+
       // 尝试所有端点（如果指定了优先端点，先尝试它）
-      const result = await tryEndpoints(processedRequest, manager, apiPath, preferredEndpoint);
+      const result = await tryEndpoints(
+        processedRequest,
+        manager,
+        apiPath,
+        preferredEndpoint,
+        allowHigherTierFallback
+      );
 
       if (!result.success) {
         // Claude 全挂，尝试 Codex 作为最终备用
@@ -1348,6 +1418,7 @@ export default {
       responseHeaders.set('X-Endpoint-Index', result.endpointIndex.toString());
       responseHeaders.set('X-Used-Base-URL', TARGET_BASE_URLS[result.baseUrlIndex]);
       responseHeaders.set('X-Base-URL-Index', result.baseUrlIndex.toString());
+      responseHeaders.set('X-Allow-Higher-Tier-Fallback', allowHigherTierFallback ? 'true' : 'false');
       if (preferredEndpoint) {
         responseHeaders.set('X-Preferred-Endpoint', preferredEndpoint);
       }

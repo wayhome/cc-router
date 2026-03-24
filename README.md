@@ -13,7 +13,7 @@
 
 ## 功能特性
 
-- **价格优先**: 按价格从低到高尝试端点（droid < aws < ultra）
+- **价格优先**: 按价格从低到高排序（droid = aws < ultra < super < claude）
 - **指定端点路由**: 支持通过路径指定优先使用的端点（如 `/claude/aws/v1/messages`）
 - **OpenAI 兼容接口**: 支持 OpenAI Chat Completions API 格式，自动转换为 Claude API
 - **智能故障转移**: 遇到 4xx/5xx 错误自动切换到下一个端点
@@ -47,7 +47,7 @@
 4. 开始使用！Claude 请求会自动选择可用端点，Codex 请求走 `/codex/v1` 主备源重试
 
 **提示**：
-- Claude 默认使用自动路由，从最便宜的 droid 端点开始尝试
+- Claude 默认使用自动路由，从最低价层级（droid/aws）开始尝试
 - Codex 统一使用 `https://your-worker.workers.dev/codex/v1/...` 路径
 - 你也可以指定 Claude 特定端点，如 `https://your-worker.workers.dev/claude/droid`
 - Claude Code 详细配置请查看 [Claude Code 配置指南](CLAUDE_CODE_SETUP.md)
@@ -111,11 +111,24 @@ curl https://your-worker.workers.dev/v1/messages \
 ```
 
 Worker 会自动：
-1. 优先尝试最便宜的 `/claude/droid` 端点
-2. 如果失败，自动切换到 `/claude/aws`
-3. 继续尝试 `/claude/ultra`
-4. 所有 Claude 端点都失败时，自动切换到 Codex（协议自动转换）
+1. 优先尝试最低价层级端点（`/claude/droid`、`/claude/aws`）
+2. 默认不会自动升级到更高价层级（`ultra/super/claude`）
+3. 若请求头 `x-ccr-tier: true`，才会继续尝试更高价层级
+4. 所有允许范围内的 Claude 端点都失败时，自动切换到 Codex（协议自动转换）
 5. 记录失败状态，连续失败 3 次后暂时跳过该端点
+
+可通过 Claude Code 的 `ANTHROPIC_CUSTOM_HEADERS` 注入开关头：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_CUSTOM_HEADERS": "x-ccr-tier: true"
+  }
+}
+```
+
+`ANTHROPIC_CUSTOM_HEADERS` 格式为多行 `Header: value`：
+`"Header1: value1\nHeader2: value2"`
 
 ### Claude 路由：指定端点
 
@@ -143,8 +156,8 @@ curl https://your-worker.workers.dev/claude/super/v1/messages \
 
 **工作原理**：
 - 首先尝试指定的端点（如 `/claude/aws`）
-- 如果指定端点失败，从该端点位置往后尝试更贵的端点（aws → ultra）
-- 如果后面的端点都失败，再尝试前面更便宜的端点（droid）
+- 默认只在“当前价格层级及以下”尝试（不会自动升到更高等级）
+- 当 `x-ccr-tier: true` 时，才会按顺序尝试更贵端点
 - 所有 Claude 端点都失败时，自动切换到 Codex 作为最终备用
 - 保持完整的故障转移和健康检查机制
 
@@ -152,6 +165,8 @@ curl https://your-worker.workers.dev/claude/super/v1/messages \
 - `/claude/aws/v1/messages` - 优先使用 aws 端点
 - `/claude/droid/v1/messages` - 优先使用 droid 端点
 - `/claude/ultra/v1/messages` - 优先使用 ultra 端点
+- `/claude/super/v1/messages` - 优先使用 super 端点
+- `/claude/v1/messages` - 优先使用 claude 端点（最高等级）
 - `/v1/messages` - 自动路由（默认行为）
 
 ### Claude 路由：OpenAI 兼容接口
@@ -311,12 +326,13 @@ curl https://your-worker.workers.dev/codex/v1/responses \
 响应头中包含调试信息：
 - `X-Route-Type`: 路由类型（`claude`、`codex`、`codex-fallback`、`claude-fallback`）
 - `X-Used-Endpoint`: 实际使用的端点路径
-- `X-Endpoint-Index`: 端点索引（0=droid, 1=aws, 2=ultra）
+- `X-Endpoint-Index`: 端点索引（0=droid, 1=aws, 2=ultra, 3=super, 4=claude）
 - `X-Used-Base-URL`: 实际使用的基础 URL（主源或备源）
 - `X-Base-URL-Index`: 基础 URL 索引（0=主源 newcli, 1=备源 dm-fox）
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
 - `X-Format-Conversion`: 如果使用了 OpenAI 格式转换，显示 "OpenAI"
 - `X-Fallback-Reason`: 跨协议备用原因（`all-claude-endpoints-failed` 或 `all-codex-sources-failed`）
+- `X-Allow-Higher-Tier-Fallback`: 是否允许向更高等级端点降级（`true/false`）
 
 说明：`X-Used-Endpoint`、`X-Endpoint-Index`、`X-Preferred-Endpoint`、`X-Format-Conversion` 主要用于 Claude/OpenAI 路由；Codex 路由重点查看 `X-Route-Type`、`X-Used-Base-URL`、`X-Base-URL-Index`。
 
@@ -362,12 +378,9 @@ Cloudflare Worker
 检查内存缓存中的端点健康状态
   ↓
 按优先级顺序尝试端点:
-  - 如果指定了优先端点，从该位置开始往后尝试
-    例如指定 ultra: ultra → droid → aws
-  - 否则按价格顺序尝试:
-    1. /claude/droid (最便宜)
-    2. /claude/aws
-    3. /claude/ultra
+  - 默认只尝试当前价格层级及以下端点（不自动升高）
+  - 设置 `x-ccr-tier: true` 后，才会继续尝试更高层级
+  - 价格层级: droid = aws < ultra < super < claude
   ↓
 对于每个端点，依次尝试两个源:
   1. 主源 (code.newcli.com)
@@ -398,7 +411,7 @@ Cloudflare Worker
   2. https://dm-fox.rjj.cc/codex/v1/*
   ↓ 两个源都失败
 自动切换到 Claude 端点 (协议自动转换):
-  3. 尝试所有 Claude 端点 (droid → aws → ultra)
+  3. 尝试所有 Claude 端点 (droid → aws → ultra → super → claude)
   ↓
 成功: 透传响应（Codex 格式或转换后的 Codex 格式）
 失败: 返回最后一个上游错误响应
