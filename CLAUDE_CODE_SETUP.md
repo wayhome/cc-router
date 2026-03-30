@@ -29,7 +29,7 @@
 - 使用 `ANTHROPIC_AUTH_TOKEN` 而不是 `apiKey`
 - 使用 `ANTHROPIC_BASE_URL` 而不是 `apiUrl`
 - 配置文件位置是 `~/.claude/settings.json`
-- 默认配置使用自动路由，Worker 会从最低价层级（droid/aws）开始尝试，且默认不自动升级到更高等级端点
+- 默认配置使用自动路由，Worker 会从最低价层级（ultra）开始尝试，且默认不自动升级到更高等级端点
 
 **高级配置**：你也可以指定特定端点作为基础 URL：
 
@@ -37,12 +37,12 @@
 {
   "env": {
     "ANTHROPIC_AUTH_TOKEN": "替换为您的API Key",
-    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev/claude/droid"
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev/claude/ultra"
   }
 }
 ```
 
-这样配置后，所有请求都会优先使用 droid 端点；默认只会在同层级内尝试（droid/aws）。
+这样配置后，所有请求都会优先使用 ultra 端点；默认只会在同层级内尝试（仅 ultra）。
 
 #### VSCode 扩展配置
 
@@ -80,17 +80,15 @@ export ANTHROPIC_API_KEY=your-api-key
 }
 ```
 
-行为：`droid -> aws`，不会自动升到 `ultra/super/claude`。
+行为：`ultra`，不会自动升到 `super/claude`。
 
 ### 2) 固定从指定端点开始
 
 把 `ANTHROPIC_BASE_URL` 改成以下之一：
 
-- `https://your-worker.workers.dev/claude/droid`（`droid -> aws`）
-- `https://your-worker.workers.dev/claude/aws`（`aws -> droid`）
-- `https://your-worker.workers.dev/claude/ultra`（`ultra -> droid -> aws`）
-- `https://your-worker.workers.dev/claude/super`（`super -> droid -> aws -> ultra`）
-- `https://your-worker.workers.dev/claude`（`claude -> droid -> aws -> ultra -> super`）
+- `https://your-worker.workers.dev/claude/ultra`（`ultra`）
+- `https://your-worker.workers.dev/claude/super`（`super -> ultra`）
+- `https://your-worker.workers.dev/claude`（`claude -> ultra -> super`）
 
 ### 3) 允许更高等级端点（按需开启）
 
@@ -121,18 +119,18 @@ curl https://your-worker.workers.dev/v1/messages \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
   -d '{
-    "model": "claude-3-5-sonnet-20241022",
+    "model": "claude-sonnet-4-6",
     "max_tokens": 100,
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 
-# 或指定优先端点（如 aws）
-curl https://your-worker.workers.dev/claude/aws/v1/messages \
+# 或指定优先端点（如 ultra）
+curl https://your-worker.workers.dev/claude/ultra/v1/messages \
   -H "x-api-key: your-api-key" \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
   -d '{
-    "model": "claude-3-5-sonnet-20241022",
+    "model": "claude-sonnet-4-6",
     "max_tokens": 100,
     "messages": [{"role": "user", "content": "Hello"}]
   }'
@@ -154,12 +152,12 @@ curl https://your-worker.workers.dev/claude/aws/v1/messages \
 {
   "env": {
     "ANTHROPIC_AUTH_TOKEN": "your-api-key",
-    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev/claude/aws"
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev/claude/ultra"
   }
 }
 ```
 
-这样配置后，所有请求都会优先使用 aws 端点；默认只会在同层级（aws/droid）内切换。
+这样配置后，所有请求都会优先使用 ultra 端点；默认只会在 ultra 端点内重试主备源。
 
 ### 通过 ANTHROPIC_CUSTOM_HEADERS 控制是否允许更高等级降级
 
@@ -181,12 +179,12 @@ curl https://your-worker.workers.dev/claude/aws/v1/messages \
 
 ### 支持的端点路径
 
-- `https://your-worker.workers.dev/claude/droid` - 优先使用 droid 端点（最便宜）
-- `https://your-worker.workers.dev/claude/aws` - 优先使用 aws 端点
-- `https://your-worker.workers.dev/claude/ultra` - 优先使用 ultra 端点
+- `https://your-worker.workers.dev/claude/ultra` - 优先使用 ultra 端点（最便宜）
 - `https://your-worker.workers.dev/claude/super` - 优先使用 super 端点
 - `https://your-worker.workers.dev/claude` - 优先使用 claude 端点（最贵）
 - `https://your-worker.workers.dev` - 自动路由（默认，推荐）
+
+说明：`/claude/droid`、`/claude/aws` 当前仅做路径兼容，不再作为可用候选端点参与调度。
 
 多数场景下建议直接使用默认自动路由。
 
@@ -196,7 +194,7 @@ curl https://your-worker.workers.dev/claude/aws/v1/messages \
 
 响应头中包含：
 - `X-Used-Endpoint`: 实际使用的端点路径
-- `X-Endpoint-Index`: 端点索引（0=droid, 1=aws, 2=ultra, 3=super, 4=claude）
+- `X-Endpoint-Index`: 端点索引（0=ultra, 1=super, 2=claude）
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
 - `X-Allow-Higher-Tier-Fallback`: 是否允许向更高等级端点降级（`true/false`）
 
@@ -233,8 +231,8 @@ A: 完全支持！Worker 会透传 Server-Sent Events (SSE) 流式响应，Claud
 
 ## 路由规则（简版）
 
-1. 默认从低价层级（droid/aws）开始，且不自动升到更高层级
-2. 设置 `x-ccr-tier: true` 后，才允许尝试 `ultra/super/claude`
+1. 默认从低价层级（ultra）开始，且不自动升到更高层级
+2. 设置 `x-ccr-tier: true` 后，才允许尝试 `super/claude`
 3. 指定端点时先尝试该端点，再按规则继续
 4. 每个端点先主源再备源，两个源都失败才换下一个端点
 

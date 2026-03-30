@@ -2,7 +2,7 @@
  * Cloudflare Worker - Claude API Smart Router
  *
  * 智能路由，在多个 Claude API 端点之间自动切换
- * - 按价格从低到高排序（droid = aws < ultra < super < claude）
+ * - 按价格从低到高排序（ultra < super < claude）
  * - 使用全局内存缓存记录端点健康状态（同一实例内共享）
  * - 自动故障转移，优先使用最便宜的可用端点
  * - 失败的端点会被临时标记，一段时间后重新尝试
@@ -21,20 +21,22 @@ const TARGET_BASE_URLS = [
 
 // 可用的端点列表（按价格从低到高排序）
 const ENDPOINTS = [
-  '/claude/droid',    // 最便宜
-  '/claude/aws',
-  '/claude/ultra',
+  '/claude/ultra',    // 最便宜（droid/aws 已暂时下线）
   '/claude/super',
   '/claude'           // 最贵
 ];
 
-// 端点价格层级（droid = aws < ultra < super < claude）
+// 已下线的旧端点，保留路径兼容（不再作为候选端点）
+const DISABLED_ENDPOINTS = [
+  '/claude/droid',
+  '/claude/aws'
+];
+
+// 端点价格层级（ultra < super < claude）
 const ENDPOINT_TIERS = {
-  '/claude/droid': 0,
-  '/claude/aws': 0,
-  '/claude/ultra': 1,
-  '/claude/super': 2,
-  '/claude': 3
+  '/claude/ultra': 0,
+  '/claude/super': 1,
+  '/claude': 2
 };
 
 // 通过 ANTHROPIC_CUSTOM_HEADERS 注入此 header 可允许向更高等级端点降级
@@ -45,6 +47,13 @@ const ROUTE_TYPES = {
   CLAUDE: 'claude',
   CODEX: 'codex'
 };
+
+const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-6';
+const SUPPORTED_CLAUDE_MODELS = [
+  'claude-opus-4-6',
+  'claude-sonnet-4-6',
+  'claude-haiku-4-5-20251001'
+];
 
 // 全局健康状态缓存（跨请求共享，同一 Worker 实例内所有请求共享）
 const globalHealthCache = new Map();
@@ -192,7 +201,7 @@ function cleanObject(obj) {
  */
 function convertOpenAIToClaude(openaiRequest) {
   const claudeRequest = {
-    model: isValidValue(openaiRequest.model) ? openaiRequest.model : 'claude-3-5-sonnet-20241022',
+    model: isValidValue(openaiRequest.model) ? openaiRequest.model : DEFAULT_CLAUDE_MODEL,
     max_tokens: isValidValue(openaiRequest.max_tokens) ? openaiRequest.max_tokens : 4096,
     messages: []
   };
@@ -327,7 +336,7 @@ async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
                       id: claudeEvent.message.id || `chatcmpl-${Date.now()}`,
                       object: 'chat.completion.chunk',
                       created: Math.floor(Date.now() / 1000),
-                      model: originalModel || claudeEvent.message.model || 'claude-3-5-sonnet-20241022',
+                      model: originalModel || claudeEvent.message.model || DEFAULT_CLAUDE_MODEL,
                       choices: [{
                         index: 0,
                         delta: { role: 'assistant', content: '' },
@@ -342,7 +351,7 @@ async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
                         id: `chatcmpl-${Date.now()}`,
                         object: 'chat.completion.chunk',
                         created: Math.floor(Date.now() / 1000),
-                        model: originalModel || 'claude-3-5-sonnet-20241022',
+                        model: originalModel || DEFAULT_CLAUDE_MODEL,
                         choices: [{
                           index: 0,
                           delta: {
@@ -367,7 +376,7 @@ async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
                         id: `chatcmpl-${Date.now()}`,
                         object: 'chat.completion.chunk',
                         created: Math.floor(Date.now() / 1000),
-                        model: originalModel || 'claude-3-5-sonnet-20241022',
+                        model: originalModel || DEFAULT_CLAUDE_MODEL,
                         choices: [{
                           index: 0,
                           delta: { content: claudeEvent.delta.text },
@@ -379,7 +388,7 @@ async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
                         id: `chatcmpl-${Date.now()}`,
                         object: 'chat.completion.chunk',
                         created: Math.floor(Date.now() / 1000),
-                        model: originalModel || 'claude-3-5-sonnet-20241022',
+                        model: originalModel || DEFAULT_CLAUDE_MODEL,
                         choices: [{
                           index: 0,
                           delta: {
@@ -407,7 +416,7 @@ async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
                         id: `chatcmpl-${Date.now()}`,
                         object: 'chat.completion.chunk',
                         created: Math.floor(Date.now() / 1000),
-                        model: originalModel || 'claude-3-5-sonnet-20241022',
+                        model: originalModel || DEFAULT_CLAUDE_MODEL,
                         choices: [{
                           index: 0,
                           delta: {},
@@ -459,6 +468,170 @@ async function convertClaudeStreamToOpenAI(claudeStream, originalModel) {
 }
 
 /**
+ * 转换 Claude SSE 流为 Codex Responses SSE 流
+ */
+async function convertClaudeStreamToCodex(claudeStream, originalModel) {
+  const reader = claudeStream.getReader();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+
+  return new ReadableStream({
+    async start(controller) {
+      let buffer = '';
+      let responseId = `resp-${Date.now()}`;
+      let outputText = '';
+      let createdSent = false;
+      let completedSent = false;
+
+      const buildBaseResponse = (status = 'in_progress') => ({
+        id: responseId,
+        object: 'response',
+        created: Math.floor(Date.now() / 1000),
+        model: originalModel || 'gpt-5.3-codex',
+        status
+      });
+
+      const emitEvent = (eventType, payload) => {
+        controller.enqueue(encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify({
+          type: eventType,
+          ...payload
+        })}\n\n`));
+      };
+
+      const emitCreated = () => {
+        if (createdSent) return;
+        emitEvent('response.created', {
+          response: buildBaseResponse('in_progress')
+        });
+        createdSent = true;
+      };
+
+      const emitCompleted = () => {
+        if (completedSent) return;
+        emitCreated();
+        emitEvent('response.output_text.done', {
+          response_id: responseId,
+          output_index: 0,
+          content_index: 0,
+          text: outputText
+        });
+        emitEvent('response.completed', {
+          response: {
+            ...buildBaseResponse('completed'),
+            output: [{
+              type: 'message',
+              role: 'assistant',
+              content: [{
+                type: 'output_text',
+                text: outputText
+              }]
+            }]
+          }
+        });
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        completedSent = true;
+      };
+
+      const emitFailed = (message, errorType = 'api_error') => {
+        if (completedSent) return;
+        emitCreated();
+        emitEvent('response.failed', {
+          response: buildBaseResponse('failed'),
+          error: {
+            type: errorType,
+            message
+          }
+        });
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        completedSent = true;
+      };
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+
+          if (done) {
+            emitCompleted();
+            controller.close();
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (!line.trim() || line.startsWith(':') || line.startsWith('event:')) continue;
+            if (!line.startsWith('data: ')) continue;
+
+            const data = line.slice(6);
+            if (data === '[DONE]') {
+              emitCompleted();
+              continue;
+            }
+
+            try {
+              const claudeEvent = JSON.parse(data);
+
+              switch (claudeEvent.type) {
+                case 'message_start':
+                  if (claudeEvent.message?.id) {
+                    responseId = claudeEvent.message.id;
+                  }
+                  emitCreated();
+                  break;
+
+                case 'content_block_delta':
+                  if (claudeEvent.delta?.type === 'text_delta') {
+                    emitCreated();
+                    const delta = claudeEvent.delta.text || '';
+                    if (delta.length > 0) {
+                      outputText += delta;
+                      emitEvent('response.output_text.delta', {
+                        response_id: responseId,
+                        output_index: 0,
+                        content_index: 0,
+                        delta
+                      });
+                    }
+                  }
+                  break;
+
+                case 'message_stop':
+                  emitCompleted();
+                  break;
+
+                case 'error':
+                  emitFailed(
+                    claudeEvent.error?.message || 'Claude fallback stream error',
+                    claudeEvent.error?.type || 'api_error'
+                  );
+                  break;
+
+                case 'ping':
+                case 'content_block_start':
+                case 'content_block_stop':
+                case 'message_delta':
+                  break;
+
+                default:
+                  break;
+              }
+            } catch (error) {
+              console.error('Error parsing Claude stream event:', error, data);
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Codex stream conversion error:', error);
+        emitFailed(error.message || 'Codex stream conversion error');
+        controller.close();
+      }
+    }
+  });
+}
+
+/**
  * 转换 Claude Messages API 响应格式为 OpenAI Chat Completions 格式
  */
 function convertClaudeToOpenAI(claudeResponse, model) {
@@ -491,7 +664,7 @@ function convertClaudeToOpenAI(claudeResponse, model) {
     id: claudeResponse.id || `chatcmpl-${Date.now()}`,
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
-    model: model || 'claude-3-5-sonnet-20241022',
+    model: model || DEFAULT_CLAUDE_MODEL,
     choices: [
       {
         index: 0,
@@ -514,11 +687,7 @@ function convertClaudeToOpenAI(claudeResponse, model) {
  * 生成 OpenAI 模型列表响应
  */
 function getOpenAIModelsResponse() {
-  const models = [
-    'claude-sonnet-4-5-20250929',
-    'claude-haiku-4-5-20251001',
-    'claude-opus-4-5-20251101'
-  ];
+  const models = SUPPORTED_CLAUDE_MODELS;
 
   return {
     object: 'list',
@@ -591,6 +760,20 @@ function parseRequestPath(url) {
       return {
         routeType: ROUTE_TYPES.CLAUDE,
         preferredEndpoint: endpoint,
+        apiPath,
+        isOpenAI: false,
+        isModels: false
+      };
+    }
+  }
+
+  // 兼容已下线路径：/claude/droid/*、/claude/aws/* -> 走默认端点池
+  for (const endpoint of DISABLED_ENDPOINTS) {
+    if (pathname.startsWith(endpoint + '/') || pathname === endpoint) {
+      const apiPath = pathname.slice(endpoint.length) || '/';
+      return {
+        routeType: ROUTE_TYPES.CLAUDE,
+        preferredEndpoint: null,
         apiPath,
         isOpenAI: false,
         isModels: false
@@ -759,7 +942,7 @@ async function tryEndpoints(request, manager, apiPath, preferredEndpoint = null,
  */
 function convertCodexToClaude(codexRequest) {
   const claudeRequest = {
-    model: 'claude-sonnet-4-5',  // 覆盖为 Claude Code 模型
+    model: DEFAULT_CLAUDE_MODEL,  // 覆盖为可用 Claude 模型
     max_tokens: codexRequest.max_tokens || 4096,
     messages: []
   };
@@ -923,6 +1106,7 @@ async function tryClaudeAsFallback(request, manager) {
   try {
     const codexBody = await request.clone().json();
     const claudeBody = convertCodexToClaude(codexBody);
+    const isStreamRequest = codexBody.stream === true;
     const requestHeaders = new Headers(request.headers);
     requestHeaders.set('Content-Type', 'application/json');
 
@@ -938,6 +1122,28 @@ async function tryClaudeAsFallback(request, manager) {
 
           const response = await fetch(claudeRequest);
           if (response.status < 400) {
+            if (isStreamRequest) {
+              const claudeStream = response.body;
+              if (!claudeStream) {
+                throw new Error('Claude fallback stream body is empty');
+              }
+              const codexStream = await convertClaudeStreamToCodex(claudeStream, codexBody.model);
+
+              return {
+                response: new Response(codexStream, {
+                  status: 200,
+                  headers: {
+                    'Content-Type': 'text/event-stream; charset=utf-8',
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive'
+                  }
+                }),
+                endpointIndex,
+                baseUrlIndex,
+                success: true
+              };
+            }
+
             const claudeResponse = await response.json();
             const codexResponse = convertClaudeResponseToCodex(claudeResponse);
 
@@ -951,8 +1157,9 @@ async function tryClaudeAsFallback(request, manager) {
               success: true
             };
           }
+          console.error(`Claude fallback failed for endpoint ${endpointIndex}, source ${baseUrlIndex}: ${response.status}`);
         } catch (error) {
-          // 继续尝试下一个源
+          console.error(`Claude fallback error for endpoint ${endpointIndex}, source ${baseUrlIndex}:`, error.message);
         }
       }
     }

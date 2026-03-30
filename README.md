@@ -13,8 +13,8 @@
 
 ## 功能特性
 
-- **价格优先**: 按价格从低到高排序（droid = aws < ultra < super < claude）
-- **指定端点路由**: 支持通过路径指定优先使用的端点（如 `/claude/aws/v1/messages`）
+- **价格优先**: 按价格从低到高排序（ultra < super < claude）
+- **指定端点路由**: 支持通过路径指定优先使用的端点（如 `/claude/ultra/v1/messages`）
 - **OpenAI 兼容接口**: 支持 OpenAI Chat Completions API 格式，自动转换为 Claude API
 - **智能故障转移**: 遇到 4xx/5xx 错误自动切换到下一个端点
 - **双源互备**: 主源 (newcli) 和备源 (dm-fox) 相互备份，单个端点失败时先尝试备源的相同端点
@@ -47,9 +47,9 @@
 4. 开始使用！Claude 请求会自动选择可用端点，Codex 请求走 `/codex/v1` 主备源重试
 
 **提示**：
-- Claude 默认使用自动路由，从最低价层级（droid/aws）开始尝试
+- Claude 默认使用自动路由，从最低价层级（ultra）开始尝试
 - Codex 统一使用 `https://your-worker.workers.dev/codex/v1/...` 路径
-- 你也可以指定 Claude 特定端点，如 `https://your-worker.workers.dev/claude/droid`
+- 你也可以指定 Claude 特定端点，如 `https://your-worker.workers.dev/claude/ultra`
 - Claude Code 详细配置请查看 [Claude Code 配置指南](CLAUDE_CODE_SETUP.md)
 
 ## 部署步骤
@@ -102,7 +102,7 @@ curl https://your-worker.workers.dev/v1/messages \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
   -d '{
-    "model": "claude-3-5-sonnet-20241022",
+    "model": "claude-sonnet-4-6",
     "max_tokens": 1024,
     "messages": [
       {"role": "user", "content": "Hello, Claude"}
@@ -111,7 +111,7 @@ curl https://your-worker.workers.dev/v1/messages \
 ```
 
 Worker 会自动：
-1. 优先尝试最低价层级端点（`/claude/droid`、`/claude/aws`）
+1. 优先尝试最低价层级端点（`/claude/ultra`）
 2. 默认不会自动升级到更高价层级（`ultra/super/claude`）
 3. 若请求头 `x-ccr-tier: true`，才会继续尝试更高价层级
 4. 所有允许范围内的 Claude 端点都失败时，自动切换到 Codex（协议自动转换）
@@ -136,12 +136,10 @@ Worker 会自动：
 
 | 场景 | `ANTHROPIC_BASE_URL` | `ANTHROPIC_CUSTOM_HEADERS` | 默认尝试顺序 |
 |---|---|---|---|
-| 最省钱（推荐默认） | `https://your-worker.workers.dev` | 不设置 | `droid -> aws` |
-| 固定从 droid 开始 | `https://your-worker.workers.dev/claude/droid` | 不设置 | `droid -> aws` |
-| 固定从 aws 开始 | `https://your-worker.workers.dev/claude/aws` | 不设置 | `aws -> droid` |
-| 固定从 ultra 开始 | `https://your-worker.workers.dev/claude/ultra` | 不设置 | `ultra -> droid -> aws` |
-| 固定从 super 开始 | `https://your-worker.workers.dev/claude/super` | 不设置 | `super -> droid -> aws -> ultra` |
-| 固定从 claude 开始 | `https://your-worker.workers.dev/claude` | 不设置 | `claude -> droid -> aws -> ultra -> super` |
+| 最省钱（推荐默认） | `https://your-worker.workers.dev` | 不设置 | `ultra` |
+| 固定从 ultra 开始 | `https://your-worker.workers.dev/claude/ultra` | 不设置 | `ultra` |
+| 固定从 super 开始 | `https://your-worker.workers.dev/claude/super` | 不设置 | `super -> ultra` |
+| 固定从 claude 开始 | `https://your-worker.workers.dev/claude` | 不设置 | `claude -> ultra -> super` |
 
 如果要允许走更高等级端点，在 `ANTHROPIC_CUSTOM_HEADERS` 加：
 `x-ccr-tier: true`
@@ -151,13 +149,13 @@ Worker 会自动：
 通过在路径中指定端点名称，可以优先使用特定端点：
 
 ```bash
-# 优先使用 aws 端点
-curl https://your-worker.workers.dev/claude/aws/v1/messages \
+# 优先使用 ultra 端点
+curl https://your-worker.workers.dev/claude/ultra/v1/messages \
   -H "x-api-key: your-api-key" \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
   -d '{
-    "model": "claude-3-5-sonnet-20241022",
+    "model": "claude-sonnet-4-6",
     "max_tokens": 1024,
     "messages": [
       {"role": "user", "content": "Hello, Claude"}
@@ -171,9 +169,7 @@ curl https://your-worker.workers.dev/claude/super/v1/messages \
 ```
 
 **支持的端点路径**：
-- `/claude/aws/v1/messages` - 优先使用 aws 端点
-- `/claude/droid/v1/messages` - 优先使用 droid 端点
-- `/claude/ultra/v1/messages` - 优先使用 ultra 端点
+- `/claude/ultra/v1/messages` - 优先使用 ultra 端点（最便宜）
 - `/claude/super/v1/messages` - 优先使用 super 端点
 - `/claude/v1/messages` - 优先使用 claude 端点（最高等级）
 - `/v1/messages` - 自动路由（默认行为）
@@ -187,7 +183,7 @@ curl https://your-worker.workers.dev/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-3-5-sonnet-20241022",
+    "model": "claude-sonnet-4-6",
     "messages": [
       {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "Hello!"}
@@ -209,8 +205,8 @@ curl https://your-worker.workers.dev/v1/chat/completions \
 
 **指定端点的 OpenAI 格式调用**：
 ```bash
-# 优先使用 aws 端点的 OpenAI 格式调用
-curl https://your-worker.workers.dev/claude/aws/v1/chat/completions \
+# 优先使用 ultra 端点的 OpenAI 格式调用
+curl https://your-worker.workers.dev/claude/ultra/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{...}'
@@ -228,19 +224,19 @@ curl https://your-worker.workers.dev/v1/models \
   "object": "list",
   "data": [
     {
-      "id": "claude-sonnet-4-5-20250929",
+      "id": "claude-opus-4-6",
+      "object": "model",
+      "created": 1677652288,
+      "owned_by": "anthropic"
+    },
+    {
+      "id": "claude-sonnet-4-6",
       "object": "model",
       "created": 1677652288,
       "owned_by": "anthropic"
     },
     {
       "id": "claude-haiku-4-5-20251001",
-      "object": "model",
-      "created": 1677652288,
-      "owned_by": "anthropic"
-    },
-    {
-      "id": "claude-opus-4-5-20251101",
       "object": "model",
       "created": 1677652288,
       "owned_by": "anthropic"
@@ -278,7 +274,7 @@ curl https://your-worker.workers.dev/codex/v1/responses \
 响应头中包含调试信息：
 - `X-Route-Type`: 路由类型（`claude`、`codex`、`codex-fallback`、`claude-fallback`）
 - `X-Used-Endpoint`: 实际使用的端点路径
-- `X-Endpoint-Index`: 端点索引（0=droid, 1=aws, 2=ultra, 3=super, 4=claude）
+- `X-Endpoint-Index`: 端点索引（0=ultra, 1=super, 2=claude）
 - `X-Used-Base-URL`: 实际使用的基础 URL（主源或备源）
 - `X-Base-URL-Index`: 基础 URL 索引（0=主源 newcli, 1=备源 dm-fox）
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
