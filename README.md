@@ -5,7 +5,7 @@
 - Codex 路由支持单端点主备源重试（`/codex/v1`）
 - 对 4xx/5xx 与网络异常自动故障转移，并保持上游接口兼容
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/your-username/cc-router)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wayhome/cc-router)
 
 **🎁 [获取 API Key](https://foxcode.rjj.cc/auth/register?aff=UI2TST)** - 注册获取 Claude/Codex API 访问权限
 
