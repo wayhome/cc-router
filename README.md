@@ -318,6 +318,8 @@ curl https://your-worker.workers.dev/v1/messages \
 
 返回头中出现 `X-Route-Type: codex-fallback` 即表示已走 GPT/Codex。
 
+说明：在 `x-force-codex: true` 模式下，`/v1/messages` 的 `tools/tool_choice` 会透传到 Codex，并将工具调用结果回转为 Claude `tool_use` 格式。
+
 ## 调试
 
 响应头中包含调试信息：
@@ -337,6 +339,23 @@ curl https://your-worker.workers.dev/v1/messages \
 ```bash
 wrangler tail
 ```
+
+## 本地预演（wrangler dev）
+
+为了避免“部署后才发现 Codex/Claude Code 不可用”，可以先在本地跑完整回归：
+
+```bash
+bash scripts/verify_local_wrangler_dev.sh
+```
+
+该脚本会自动：
+- 启动本地 `wrangler dev`（默认 `http://127.0.0.1:8787`）
+- 运行完整验证（`/codex/v1/models`、`/codex/v1/chat/completions`、tools、`x-force-codex`）
+- 测试结束后自动关闭本地进程
+
+可选环境变量：
+- `CCR_LOCAL_PORT`：本地端口（默认 `8787`）
+- `WRANGLER_HOME_DIR`：wrangler HOME 目录（默认 `/tmp/wrangler-home-$USER`，用于规避日志权限问题）
 
 ## 配置调整
 

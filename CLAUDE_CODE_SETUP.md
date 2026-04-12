@@ -123,6 +123,7 @@ export ANTHROPIC_API_KEY=your-api-key
 - 优先走 Codex 路由（`/codex/v1/responses`）
 - 成功时响应头会返回 `X-Route-Type: codex-fallback`
 - 响应体仍保持 Claude Messages 兼容格式，便于 Claude Code 直接消费
+- `tools/tool_choice` 会透传到 Codex，并将工具调用回转为 Claude `tool_use`
 
 ## 验证配置
 

@@ -21,8 +21,10 @@ model_detail_headers="$tmp_dir/model-detail.headers"
 model_detail_body="$tmp_dir/model-detail.body"
 tools_headers="$tmp_dir/tools.headers"
 tools_body="$tmp_dir/tools.body"
+force_tools_headers="$tmp_dir/force-tools.headers"
+force_tools_body="$tmp_dir/force-tools.body"
 
-echo "[0/3] Models request..."
+echo "[1/5] Models request..."
 curl -sS \
   -D "$models_headers" \
   -o "$models_body" \
@@ -42,7 +44,7 @@ grep -q '"gpt-5.4"' "$models_body"
 grep -q '"gpt-5.3-codex"' "$models_body"
 grep -q '"context_length"[[:space:]]*:[[:space:]]*400000' "$models_body"
 
-echo "[0.5/3] Model detail request..."
+echo "[2/5] Model detail request..."
 curl -sS \
   -D "$model_detail_headers" \
   -o "$model_detail_body" \
@@ -61,7 +63,7 @@ grep -q "\"id\"[[:space:]]*:[[:space:]]*\"$MODEL\"" "$model_detail_body"
 grep -q '"context_length"[[:space:]]*:[[:space:]]*400000' "$model_detail_body"
 grep -q '"max_output_tokens"[[:space:]]*:[[:space:]]*128000' "$model_detail_body"
 
-echo "[1/3] Non-stream request..."
+echo "[3/5] Non-stream request..."
 curl -sS \
   -D "$nonstream_headers" \
   -o "$nonstream_body" \
@@ -86,7 +88,7 @@ grep -qi '^x-format-conversion:[[:space:]]*openai-chat<->codex-responses' "$nons
 grep -q '"object"[[:space:]]*:[[:space:]]*"chat.completion"' "$nonstream_body"
 grep -q '"choices"' "$nonstream_body"
 
-echo "[2/4] Stream request..."
+echo "[4/5] Stream request..."
 curl -sS -N \
   -D "$stream_headers" \
   -o "$stream_body" \
@@ -111,7 +113,7 @@ grep -qi '^x-format-conversion:[[:space:]]*openai-chat<->codex-responses' "$stre
 grep -q 'chat.completion.chunk' "$stream_body"
 grep -q 'data: \[DONE\]' "$stream_body"
 
-echo "[3/4] Tools request..."
+echo "[5/5] Tools request..."
 curl -sS \
   -D "$tools_headers" \
   -o "$tools_body" \
@@ -148,4 +150,41 @@ grep -qi '^x-route-type:[[:space:]]*codex' "$tools_headers"
 grep -q '"tool_calls"' "$tools_body"
 grep -q '"finish_reason"[[:space:]]*:[[:space:]]*"tool_calls"' "$tools_body"
 
-echo "OK: /codex/v1/models + /codex/v1/chat/completions (non-stream + stream + tools) passed"
+echo "[Extra] Claude /v1/messages with x-force-codex + tools..."
+curl -sS \
+  -D "$force_tools_headers" \
+  -o "$force_tools_body" \
+  -H "Authorization: Bearer $CCR_API_KEY" \
+  -H "x-api-key: $CCR_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-force-codex: true" \
+  -H "Content-Type: application/json" \
+  "$BASE_URL/v1/messages" \
+  -d "{
+    \"model\": \"claude-sonnet-4-6\",
+    \"max_tokens\": 512,
+    \"messages\": [{\"role\": \"user\", \"content\": \"Call get_time tool only.\"}],
+    \"tools\": [{
+      \"name\": \"get_time\",
+      \"description\": \"Return current time\",
+      \"input_schema\": {
+        \"type\": \"object\",
+        \"properties\": {},
+        \"additionalProperties\": false
+      }
+    }],
+    \"tool_choice\": {\"type\": \"any\"}
+  }"
+
+force_tools_status="$(head -n 1 "$force_tools_headers" | awk '{print $2}')"
+if [[ "$force_tools_status" != "200" ]]; then
+  echo "Force-codex tools request failed with status: $force_tools_status"
+  cat "$force_tools_body"
+  exit 1
+fi
+
+grep -qi '^x-route-type:[[:space:]]*codex-fallback' "$force_tools_headers"
+grep -q '"stop_reason"[[:space:]]*:[[:space:]]*"tool_use"' "$force_tools_body"
+grep -q '"type"[[:space:]]*:[[:space:]]*"tool_use"' "$force_tools_body"
+
+echo "OK: models + chat.completions(non-stream/stream/tools) + forced codex tools passed"

@@ -1204,24 +1204,113 @@ function convertClaudeToCodexRequest(claudeRequest, modelOverride) {
     model: requestedModel || 'gpt-5.3-codex'  // 默认覆盖为 Codex 模型
   };
 
-  let inputParts = [];
-  if (claudeRequest.system) inputParts.push(claudeRequest.system);
+  const normalizeText = (content) => {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    const chunks = [];
+    for (const part of content) {
+      if (!part) continue;
+      if (typeof part === 'string') {
+        chunks.push(part);
+        continue;
+      }
+      if (typeof part.text === 'string') {
+        chunks.push(part.text);
+      }
+    }
+    return chunks.join('');
+  };
+
+  const inputParts = [];
+  if (claudeRequest.system) {
+    const systemText = normalizeText(claudeRequest.system);
+    if (systemText) {
+      codexRequest.instructions = systemText;
+    }
+  }
 
   if (claudeRequest.messages && Array.isArray(claudeRequest.messages)) {
     for (const msg of claudeRequest.messages) {
       const role = msg.role === 'user' ? 'User' : 'Assistant';
-      const content = typeof msg.content === 'string' ? msg.content :
-                     (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join('') : '');
-      inputParts.push(`${role}: ${content}`);
+      if (typeof msg.content === 'string') {
+        if (msg.content) inputParts.push(`${role}: ${msg.content}`);
+        continue;
+      }
+
+      if (!Array.isArray(msg.content)) continue;
+
+      const textChunks = [];
+      for (const block of msg.content) {
+        if (!block) continue;
+
+        if (typeof block.text === 'string' && block.text) {
+          textChunks.push(block.text);
+        }
+
+        if (block.type === 'tool_use') {
+          const toolName = block.name || 'unknown_tool';
+          const toolId = block.id || `toolu_${Date.now()}`;
+          let toolInput = '{}';
+          if (typeof block.input === 'string') {
+            toolInput = block.input;
+          } else if (block.input && typeof block.input === 'object') {
+            toolInput = JSON.stringify(block.input);
+          }
+          inputParts.push(`${role} called tool ${toolName} (${toolId}) with input: ${toolInput}`);
+        }
+
+        if (block.type === 'tool_result') {
+          const toolUseId = block.tool_use_id || 'unknown_tool_use_id';
+          const resultText = normalizeText(block.content);
+          inputParts.push(`Tool result for ${toolUseId}: ${resultText}`);
+        }
+      }
+
+      if (textChunks.length > 0) {
+        inputParts.push(`${role}: ${textChunks.join('')}`);
+      }
     }
   }
 
-  codexRequest.input = inputParts.join('\n\n');
+  codexRequest.input = inputParts.join('\n\n') || ' ';
+
+  if (Array.isArray(claudeRequest.tools) && claudeRequest.tools.length > 0) {
+    const mappedTools = [];
+    for (const tool of claudeRequest.tools) {
+      if (!tool || !tool.name) continue;
+      mappedTools.push({
+        type: 'function',
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.input_schema || { type: 'object', properties: {} }
+      });
+    }
+    if (mappedTools.length > 0) {
+      codexRequest.tools = mappedTools;
+    }
+  }
+
+  if (claudeRequest.tool_choice && typeof claudeRequest.tool_choice === 'object') {
+    const choiceType = claudeRequest.tool_choice.type;
+    if (choiceType === 'auto') {
+      codexRequest.tool_choice = 'auto';
+    } else if (choiceType === 'any') {
+      codexRequest.tool_choice = 'required';
+    } else if (choiceType === 'none') {
+      codexRequest.tool_choice = 'none';
+    } else if (choiceType === 'tool' && claudeRequest.tool_choice.name) {
+      codexRequest.tool_choice = {
+        type: 'function',
+        name: claudeRequest.tool_choice.name
+      };
+    }
+  }
+
   if (claudeRequest.max_tokens !== undefined) codexRequest.max_output_tokens = claudeRequest.max_tokens;
   if (claudeRequest.temperature !== undefined) codexRequest.temperature = claudeRequest.temperature;
   if (claudeRequest.stream !== undefined) codexRequest.stream = claudeRequest.stream;
 
-  return codexRequest;
+  return cleanObject(codexRequest);
 }
 
 function extractCodexOutputText(codexResponse) {
@@ -1328,17 +1417,54 @@ function extractCodexToolCalls(codexResponse) {
  */
 function convertCodexResponseToClaude(codexResponse) {
   const usage = codexResponse.usage || {};
+  const text = extractCodexOutputText(codexResponse);
+  const toolCalls = extractCodexToolCalls(codexResponse);
+  const content = [];
+
+  if (text) {
+    content.push({
+      type: 'text',
+      text
+    });
+  }
+
+  for (let i = 0; i < toolCalls.length; i++) {
+    const call = toolCalls[i];
+    if (!call?.function?.name) continue;
+
+    let parsedInput = {};
+    if (typeof call.function.arguments === 'string' && call.function.arguments.trim()) {
+      try {
+        parsedInput = JSON.parse(call.function.arguments);
+      } catch (error) {
+        parsedInput = { raw_arguments: call.function.arguments };
+      }
+    } else if (call.function.arguments && typeof call.function.arguments === 'object') {
+      parsedInput = call.function.arguments;
+    }
+
+    content.push({
+      type: 'tool_use',
+      id: call.id || `toolu_${Date.now()}_${i}`,
+      name: call.function.name,
+      input: parsedInput
+    });
+  }
+
+  if (content.length === 0) {
+    content.push({
+      type: 'text',
+      text: ''
+    });
+  }
 
   return {
     id: codexResponse.id || `msg-${Date.now()}`,
     type: 'message',
     role: 'assistant',
-    content: [{
-      type: 'text',
-      text: extractCodexOutputText(codexResponse)
-    }],
+    content,
     model: codexResponse.model,
-    stop_reason: 'end_turn',
+    stop_reason: toolCalls.length > 0 ? 'tool_use' : 'end_turn',
     usage: {
       input_tokens: usage.prompt_tokens ?? usage.input_tokens ?? 0,
       output_tokens: usage.completion_tokens ?? usage.output_tokens ?? 0

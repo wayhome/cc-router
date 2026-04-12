@@ -96,3 +96,29 @@
 - 根因是原先 `convertOpenAIToCodexRequest` 走 Claude 中转并把结构压成纯文本，导致 `tools/tool_choice` 丢失。
 - 已改为直接构造 Codex Responses 请求体，保留 `tools/tool_choice/parallel_tool_calls`。
 - 已补齐 `response.output_item.*`、`response.function_call_arguments.*` 事件到 Chat Completions `tool_calls` 的映射。
+
+## 2026-04-12 修复 x-force-codex 下 Claude tools 丢失
+
+- [x] 修复 Claude -> Codex fallback 请求转换，透传 `tools/tool_choice`
+- [x] 修复 Codex -> Claude fallback 响应转换，回转 `tool_use` 与 `stop_reason=tool_use`
+- [x] 扩展验证脚本，增加 `/v1/messages + x-force-codex + tools` 校验
+- [x] 更新 README/CLAUDE_CODE_SETUP，明确强制 Codex 下支持工具调用
+- [ ] 部署后复测 Claude Code 工具调用链路
+
+### Review
+
+- 根因：`convertClaudeToCodexRequest` 只拼接纯文本，导致 Codex 收不到工具定义与选择策略。
+- 影响：`x-force-codex` 场景下模型无法产生可被 Claude Code 识别的 `tool_use`。
+- 修复：请求侧映射 `tools/tool_choice`，响应侧将 Codex `function_call` 映射为 Claude `tool_use`。
+
+## 2026-04-12 增加 wrangler dev 本地回归
+
+- [x] 新增 `scripts/verify_local_wrangler_dev.sh` 一键本地预演脚本
+- [x] 脚本启动本地 `wrangler dev` 后自动执行全量回归并自动清理进程
+- [x] 本机执行通过（含 tools 与 x-force-codex 场景）
+- [x] README 补充本地预演说明与可选环境变量
+
+### Review
+
+- 目标是把“部署后才暴露问题”前移到本地开发阶段。
+- 本地预演命令：`bash scripts/verify_local_wrangler_dev.sh`。
