@@ -18,7 +18,7 @@
 - **OpenAI 兼容接口**: 支持 OpenAI Chat Completions API 格式，自动转换为 Claude API
 - **智能故障转移**: 遇到 4xx/5xx 错误自动切换到下一个端点
 - **双源互备**: 主源 (newcli) 和备源 (dm-fox) 相互备份，单个端点失败时先尝试备源的相同端点
-- **Codex 兼容代理**: 支持 `/codex/v1` 路由透传，单端点下自动主备源切换并对 4xx/5xx 重试
+- **Codex 兼容代理**: 支持 `/codex/v1` 路由主备重试；`/responses` 透传，`/chat/completions` 自动格式转换
 - **跨协议备用**: Claude 全挂时自动切换到 Codex，Codex 全挂时自动切换到 Claude（自动协议转换）
 - **内存状态管理**: 使用全局内存缓存记录端点健康状态（同一实例内共享）
 - **自动冷却**: 连续失败 3 次的端点会被标记为不可用 1 分钟
@@ -250,7 +250,7 @@ curl https://your-worker.workers.dev/v1/models \
 - 非流式和流式响应都会自动转换为 OpenAI 兼容格式（含 SSE）
 - 建议直接用 OpenAI SDK/LangChain/LlamaIndex 按 OpenAI 方式接入
 
-### Codex 路由：透传代理
+### Codex 路由：透传代理 + Chat Completions 兼容
 
 Codex 默认上游路由是 `https://code.newcli.com/codex/v1`。通过本 Worker 时，请使用相同路径前缀：
 
@@ -264,8 +264,25 @@ curl https://your-worker.workers.dev/codex/v1/responses \
   }'
 ```
 
+如果你希望在 Codex 路由下直接使用 OpenAI Chat Completions 格式，也可以调用：
+
+```bash
+curl https://your-worker.workers.dev/codex/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.3-codex",
+    "messages": [
+      {"role": "user", "content": "Write a haiku about retries."}
+    ]
+  }'
+```
+
 **行为说明**：
-- 请求和响应都会原样透传，不做 Claude/OpenAI 格式转换
+- `/codex/v1/models`：返回 OpenAI Models 列表格式的 Codex 模型清单（用于 SDK 探活/模型枚举，含 `gpt-5.4`）
+- `/codex/v1/models/{model}`：返回单模型元数据（含 `context_length`/`max_output_tokens` 等字段，默认按 GPT-5 系列 `400k/128k`）
+- `/codex/v1/responses`：请求和响应都会原样透传，不做 Claude/OpenAI 格式转换
+- `/codex/v1/chat/completions`：自动转换为 Codex Responses 请求并将响应转换回 OpenAI Chat Completions（支持 SSE 与 tools/tool_calls）
 - 先尝试主源 `https://code.newcli.com`，失败（4xx/5xx 或网络错误）后自动尝试备源 `https://dm-fox.rjj.cc`
 - 当两个源都失败时，自动切换到 Claude 端点作为备用（协议自动转换）
 - 如果仍然失败，优先返回最后一个上游错误响应体，保持 Codex 错误格式兼容
@@ -310,7 +327,7 @@ curl https://your-worker.workers.dev/v1/messages \
 - `X-Used-Base-URL`: 实际使用的基础 URL（主源或备源）
 - `X-Base-URL-Index`: 基础 URL 索引（0=主源 newcli, 1=备源 dm-fox）
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
-- `X-Format-Conversion`: 如果使用了 OpenAI 格式转换，显示 "OpenAI"
+- `X-Format-Conversion`: 格式转换标记（例如 `OpenAI` 或 `openai-chat<->codex-responses`）
 - `X-Fallback-Reason`: 跨协议备用原因（`all-claude-endpoints-failed` 或 `all-codex-sources-failed`）
 - `X-Allow-Higher-Tier-Fallback`: 是否允许向更高等级端点降级（`true/false`）
 
