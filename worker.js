@@ -815,6 +815,449 @@ async function convertClaudeStreamToCodex(claudeStream, originalModel) {
 }
 
 /**
+ * 将 Claude Messages JSON 响应包装为 Claude SSE 流（用于 stream=true 的兜底场景）
+ */
+function convertClaudeMessageToSSE(claudeResponse) {
+  const encoder = new TextEncoder();
+
+  return new ReadableStream({
+    start(controller) {
+      const emitEvent = (eventType, payload) => {
+        controller.enqueue(encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify({
+          type: eventType,
+          ...payload
+        })}\n\n`));
+      };
+
+      const messageId = claudeResponse.id || `msg_${Date.now()}`;
+      const model = claudeResponse.model || DEFAULT_CLAUDE_MODEL;
+      const usage = claudeResponse.usage || {};
+      const blocks = Array.isArray(claudeResponse.content) ? claudeResponse.content : [];
+
+      emitEvent('message_start', {
+        message: {
+          id: messageId,
+          type: 'message',
+          role: 'assistant',
+          content: [],
+          model,
+          stop_reason: null,
+          stop_sequence: null,
+          usage: {
+            input_tokens: usage.input_tokens || 0,
+            output_tokens: 0
+          }
+        }
+      });
+
+      let blockIndex = 0;
+      for (const block of blocks) {
+        if (!block) continue;
+
+        if (block.type === 'text') {
+          emitEvent('content_block_start', {
+            index: blockIndex,
+            content_block: {
+              type: 'text',
+              text: ''
+            }
+          });
+          if (typeof block.text === 'string' && block.text) {
+            emitEvent('content_block_delta', {
+              index: blockIndex,
+              delta: {
+                type: 'text_delta',
+                text: block.text
+              }
+            });
+          }
+          emitEvent('content_block_stop', { index: blockIndex });
+          blockIndex++;
+          continue;
+        }
+
+        if (block.type === 'tool_use') {
+          emitEvent('content_block_start', {
+            index: blockIndex,
+            content_block: {
+              type: 'tool_use',
+              id: block.id || `toolu_${Date.now()}_${blockIndex}`,
+              name: block.name || 'unknown_tool',
+              input: {}
+            }
+          });
+
+          let inputJson = '';
+          try {
+            inputJson = JSON.stringify(block.input || {});
+          } catch (error) {
+            inputJson = '{}';
+          }
+          if (inputJson && inputJson !== '{}') {
+            emitEvent('content_block_delta', {
+              index: blockIndex,
+              delta: {
+                type: 'input_json_delta',
+                partial_json: inputJson
+              }
+            });
+          }
+
+          emitEvent('content_block_stop', { index: blockIndex });
+          blockIndex++;
+        }
+      }
+
+      emitEvent('message_delta', {
+        delta: {
+          stop_reason: claudeResponse.stop_reason || 'end_turn',
+          stop_sequence: null
+        },
+        usage: {
+          output_tokens: usage.output_tokens || 0
+        }
+      });
+      emitEvent('message_stop', {});
+      controller.close();
+    }
+  });
+}
+
+/**
+ * 转换 Codex Responses SSE 流为 Claude Messages SSE 流
+ */
+async function convertCodexStreamToClaude(codexStream, fallbackModel) {
+  if (!codexStream) {
+    throw new Error('Codex stream body is empty');
+  }
+
+  const reader = codexStream.getReader();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+
+  return new ReadableStream({
+    async start(controller) {
+      let buffer = '';
+      let messageId = `msg_${Date.now()}`;
+      let model = fallbackModel || 'gpt-5.3-codex';
+      let inputTokens = 0;
+      let outputTokens = 0;
+      let messageStarted = false;
+      let nextBlockIndex = 0;
+      let textBlockIndex = null;
+      let sawToolUse = false;
+      let finalized = false;
+      const toolBlocks = new Map(); // item_id => { index, id, name, closed, emittedArgsDelta }
+
+      const emitEvent = (eventType, payload) => {
+        controller.enqueue(encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify({
+          type: eventType,
+          ...payload
+        })}\n\n`));
+      };
+
+      const ensureMessageStart = () => {
+        if (messageStarted) return;
+        emitEvent('message_start', {
+          message: {
+            id: messageId,
+            type: 'message',
+            role: 'assistant',
+            content: [],
+            model,
+            stop_reason: null,
+            stop_sequence: null,
+            usage: {
+              input_tokens: inputTokens,
+              output_tokens: 0
+            }
+          }
+        });
+        messageStarted = true;
+      };
+
+      const ensureTextBlockStart = () => {
+        ensureMessageStart();
+        if (textBlockIndex !== null) return;
+        textBlockIndex = nextBlockIndex++;
+        emitEvent('content_block_start', {
+          index: textBlockIndex,
+          content_block: {
+            type: 'text',
+            text: ''
+          }
+        });
+      };
+
+      const closeTextBlockIfOpen = () => {
+        if (textBlockIndex === null) return;
+        emitEvent('content_block_stop', { index: textBlockIndex });
+        textBlockIndex = null;
+      };
+
+      const ensureToolBlock = (itemId, toolName, toolCallId) => {
+        if (!itemId) return null;
+        if (toolBlocks.has(itemId)) {
+          return toolBlocks.get(itemId);
+        }
+
+        ensureMessageStart();
+        closeTextBlockIfOpen();
+        sawToolUse = true;
+
+        const block = {
+          index: nextBlockIndex++,
+          id: toolCallId || itemId,
+          name: toolName || 'unknown_tool',
+          closed: false,
+          emittedArgsDelta: false
+        };
+        toolBlocks.set(itemId, block);
+
+        emitEvent('content_block_start', {
+          index: block.index,
+          content_block: {
+            type: 'tool_use',
+            id: block.id,
+            name: block.name,
+            input: {}
+          }
+        });
+
+        return block;
+      };
+
+      const emitToolArgsDelta = (block, partialJson) => {
+        if (!block || !partialJson) return;
+        block.emittedArgsDelta = true;
+        emitEvent('content_block_delta', {
+          index: block.index,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: partialJson
+          }
+        });
+      };
+
+      const closeToolBlock = (block) => {
+        if (!block || block.closed) return;
+        emitEvent('content_block_stop', { index: block.index });
+        block.closed = true;
+      };
+
+      const finalize = (stopReason = 'end_turn') => {
+        if (finalized) return;
+        finalized = true;
+
+        if (!messageStarted) {
+          ensureMessageStart();
+        }
+
+        closeTextBlockIfOpen();
+        for (const block of toolBlocks.values()) {
+          closeToolBlock(block);
+        }
+
+        emitEvent('message_delta', {
+          delta: {
+            stop_reason: stopReason,
+            stop_sequence: null
+          },
+          usage: {
+            output_tokens: outputTokens
+          }
+        });
+        emitEvent('message_stop', {});
+        controller.close();
+      };
+
+      const handlePayload = (eventType, rawPayload) => {
+        if (!rawPayload || rawPayload === '[DONE]') return;
+
+        try {
+          const payload = JSON.parse(rawPayload);
+          const type = payload.type || eventType;
+
+          if (type === 'response.created' && payload.response) {
+            const response = payload.response;
+            messageId = response.id || messageId;
+            model = fallbackModel || response.model || model;
+            const usage = response.usage || {};
+            inputTokens = usage.input_tokens ?? usage.prompt_tokens ?? inputTokens;
+            ensureMessageStart();
+            return;
+          }
+
+          if (type === 'response.output_text.delta' && typeof payload.delta === 'string') {
+            ensureTextBlockStart();
+            if (payload.delta) {
+              emitEvent('content_block_delta', {
+                index: textBlockIndex,
+                delta: {
+                  type: 'text_delta',
+                  text: payload.delta
+                }
+              });
+            }
+            return;
+          }
+
+          if (type === 'response.output_text.done' && typeof payload.text === 'string') {
+            if (payload.text) {
+              ensureTextBlockStart();
+              emitEvent('content_block_delta', {
+                index: textBlockIndex,
+                delta: {
+                  type: 'text_delta',
+                  text: payload.text
+                }
+              });
+            }
+            return;
+          }
+
+          if (type === 'response.output_item.added' && payload.item?.type === 'function_call') {
+            const item = payload.item;
+            ensureToolBlock(item.id || item.call_id, item.name, item.call_id || item.id);
+            return;
+          }
+
+          if (type === 'response.function_call_arguments.delta' && typeof payload.delta === 'string') {
+            const block = ensureToolBlock(
+              payload.item_id,
+              payload.name,
+              payload.call_id || payload.item_id
+            );
+            emitToolArgsDelta(block, payload.delta);
+            return;
+          }
+
+          if (type === 'response.function_call_arguments.done' && typeof payload.arguments === 'string') {
+            const block = ensureToolBlock(
+              payload.item_id,
+              payload.name,
+              payload.call_id || payload.item_id
+            );
+            if (block && !block.emittedArgsDelta && payload.arguments) {
+              emitToolArgsDelta(block, payload.arguments);
+            }
+            return;
+          }
+
+          if (type === 'response.output_item.done' && payload.item?.type === 'function_call') {
+            const item = payload.item;
+            const block = ensureToolBlock(item.id || item.call_id, item.name, item.call_id || item.id);
+            if (block && !block.emittedArgsDelta && typeof item.arguments === 'string' && item.arguments) {
+              emitToolArgsDelta(block, item.arguments);
+            }
+            closeToolBlock(block);
+            return;
+          }
+
+          if (type === 'response.completed') {
+            const response = payload.response || {};
+            const usage = response.usage || {};
+            outputTokens = usage.output_tokens ?? usage.completion_tokens ?? outputTokens;
+            const responseToolCalls = extractCodexToolCalls(response);
+            if (responseToolCalls.length > 0) {
+              for (const call of responseToolCalls) {
+                if (!call?.function?.name) continue;
+                const itemId = call.id || `call_${Date.now()}_${nextBlockIndex}`;
+                const block = ensureToolBlock(itemId, call.function.name, call.id || itemId);
+                const rawArgs = call.function.arguments;
+                const args = typeof rawArgs === 'string'
+                  ? rawArgs
+                  : JSON.stringify(rawArgs || {});
+                if (block && !block.emittedArgsDelta && args && args !== '{}') {
+                  emitToolArgsDelta(block, args);
+                }
+                closeToolBlock(block);
+              }
+            }
+            const hasTools = sawToolUse || responseToolCalls.length > 0;
+            finalize(hasTools ? 'tool_use' : 'end_turn');
+            return;
+          }
+
+          if (type === 'response.failed' || type === 'error') {
+            emitEvent('error', {
+              error: {
+                type: payload.error?.type || 'api_error',
+                message: payload.error?.message || 'Codex stream failed'
+              }
+            });
+            finalize('end_turn');
+          }
+        } catch (error) {
+          console.error('Error parsing Codex->Claude stream event:', error, rawPayload);
+        }
+      };
+
+      const processBuffer = (flush = false) => {
+        const lines = buffer.split('\n');
+        if (!flush) {
+          buffer = lines.pop() || '';
+        } else {
+          buffer = '';
+        }
+
+        let eventType = '';
+        let dataLines = [];
+
+        const commitEvent = () => {
+          if (dataLines.length === 0) return;
+          handlePayload(eventType, dataLines.join('\n'));
+          eventType = '';
+          dataLines = [];
+        };
+
+        for (const rawLine of lines) {
+          const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+          if (line === '') {
+            commitEvent();
+            continue;
+          }
+          if (line.startsWith(':')) continue;
+          if (line.startsWith('event:')) {
+            eventType = line.slice(6).trim();
+            continue;
+          }
+          if (line.startsWith('data:')) {
+            dataLines.push(line.slice(5).trimStart());
+          }
+        }
+
+        if (flush) commitEvent();
+      };
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            processBuffer(true);
+            // 如果上游异常提前结束且没有 response.completed，按当前状态收尾
+            finalize((sawToolUse || toolBlocks.size > 0) ? 'tool_use' : 'end_turn');
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          processBuffer(false);
+        }
+      } catch (error) {
+        console.error('Codex->Claude stream conversion error:', error);
+        emitEvent('error', {
+          error: {
+            type: 'api_error',
+            message: error.message || 'Codex->Claude stream conversion error'
+          }
+        });
+        finalize(sawToolUse ? 'tool_use' : 'end_turn');
+      }
+    }
+  });
+}
+
+/**
  * 转换 Claude Messages API 响应格式为 OpenAI Chat Completions 格式
  */
 function convertClaudeToOpenAI(claudeResponse, model) {
@@ -2020,13 +2463,19 @@ async function tryCodexAsFallback(request, manager) {
   try {
     const claudeBody = await request.clone().json();
     const codexBody = convertClaudeToCodexRequest(claudeBody);
+    const isStreamRequest = claudeBody.stream === true;
     if (codexBody.stream === undefined) {
-      // Claude 非流式请求默认转为 Codex 非流式，避免上游返回 SSE 导致 JSON 解析失败。
+      // 如果 Claude 请求未显式指定 stream，默认按非流式处理。
       codexBody.stream = false;
+    } else if (isStreamRequest) {
+      // Claude stream=true 时强制 Codex 走流式，避免降级为 JSON。
+      codexBody.stream = true;
     }
     const requestHeaders = new Headers(request.headers);
     requestHeaders.set('Content-Type', 'application/json');
-    requestHeaders.set('Accept', 'application/json');
+    requestHeaders.set('Accept', isStreamRequest ? 'text/event-stream' : 'application/json');
+    let lastErrorResponse = null;
+    let lastErrorBaseUrlIndex = -1;
 
     for (let baseUrlIndex = 0; baseUrlIndex < TARGET_BASE_URLS.length; baseUrlIndex++) {
       try {
@@ -2040,6 +2489,41 @@ async function tryCodexAsFallback(request, manager) {
         const response = await fetch(codexRequest);
         if (response.status < 400) {
           const contentType = (response.headers.get('content-type') || '').toLowerCase();
+
+          if (isStreamRequest) {
+            if (contentType.includes('text/event-stream')) {
+              const claudeStream = await convertCodexStreamToClaude(response.body, claudeBody.model);
+              return {
+                response: new Response(claudeStream, {
+                  status: 200,
+                  headers: {
+                    'Content-Type': 'text/event-stream; charset=utf-8',
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive'
+                  }
+                }),
+                baseUrlIndex,
+                success: true
+              };
+            }
+
+            // 上游未返回流时，兜底包装为 Claude SSE，保持 stream 协议一致。
+            const codexJson = await response.json();
+            const claudeJson = convertCodexResponseToClaude(codexJson);
+            return {
+              response: new Response(convertClaudeMessageToSSE(claudeJson), {
+                status: 200,
+                headers: {
+                  'Content-Type': 'text/event-stream; charset=utf-8',
+                  'Cache-Control': 'no-cache',
+                  'Connection': 'keep-alive'
+                }
+              }),
+              baseUrlIndex,
+              success: true
+            };
+          }
+
           const codexResponse = contentType.includes('text/event-stream')
             ? await parseCodexSSEToResponse(response.body)
             : await response.json();
@@ -2055,11 +2539,18 @@ async function tryCodexAsFallback(request, manager) {
           };
         } else {
           console.error(`Codex fallback failed for source ${baseUrlIndex}: ${response.status}`);
+          lastErrorResponse = response;
+          lastErrorBaseUrlIndex = baseUrlIndex;
         }
       } catch (error) {
         console.error(`Codex fallback error for source ${baseUrlIndex}:`, error.message);
       }
     }
+    return {
+      response: lastErrorResponse,
+      baseUrlIndex: lastErrorBaseUrlIndex,
+      success: false
+    };
   } catch (error) {
     console.error('Codex fallback error:', error);
   }
@@ -2643,6 +3134,40 @@ export default {
             headers: codexHeaders
           });
         }
+
+        if (codexResult.response) {
+          const failHeaders = new Headers(codexResult.response.headers);
+          applyCorsHeaders(failHeaders);
+          failHeaders.set('X-Route-Type', 'codex-fallback');
+          failHeaders.set('X-Fallback-Reason', 'forced-by-header');
+          if (codexResult.baseUrlIndex >= 0) {
+            failHeaders.set('X-Used-Base-URL', TARGET_BASE_URLS[codexResult.baseUrlIndex]);
+            failHeaders.set('X-Base-URL-Index', codexResult.baseUrlIndex.toString());
+          }
+
+          return new Response(codexResult.response.body, {
+            status: codexResult.response.status,
+            statusText: codexResult.response.statusText,
+            headers: failHeaders
+          });
+        }
+
+        const forceErrorHeaders = new Headers({
+          'Content-Type': 'application/json'
+        });
+        applyCorsHeaders(forceErrorHeaders);
+        forceErrorHeaders.set('X-Route-Type', 'codex-fallback');
+        forceErrorHeaders.set('X-Fallback-Reason', 'forced-by-header');
+
+        return new Response(JSON.stringify({
+          error: {
+            message: 'x-force-codex is enabled, but all codex sources failed',
+            type: 'api_error'
+          }
+        }), {
+          status: 503,
+          headers: forceErrorHeaders
+        });
       }
 
       // 默认不升级到更高价格层级；可通过自定义 header 开启

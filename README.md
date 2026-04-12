@@ -318,7 +318,8 @@ curl https://your-worker.workers.dev/v1/messages \
 
 返回头中出现 `X-Route-Type: codex-fallback` 即表示已走 GPT/Codex。
 
-说明：在 `x-force-codex: true` 模式下，`/v1/messages` 的 `tools/tool_choice` 会透传到 Codex，并将工具调用结果回转为 Claude `tool_use` 格式。
+说明：在 `x-force-codex: true` 模式下，`/v1/messages` 的 `tools/tool_choice` 会透传到 Codex，并将工具调用结果回转为 Claude `tool_use` 格式；`stream: true` 时返回 Claude SSE 事件流（不降级为 JSON）。
+另外，当 `x-force-codex: true` 且所有 Codex 源都失败时，会直接返回 Codex 错误响应（`X-Fallback-Reason: forced-by-header`），不会再回退到 Claude 路由。
 
 ## 调试
 
@@ -330,7 +331,7 @@ curl https://your-worker.workers.dev/v1/messages \
 - `X-Base-URL-Index`: 基础 URL 索引（0=主源 newcli, 1=备源 dm-fox）
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
 - `X-Format-Conversion`: 格式转换标记（例如 `OpenAI` 或 `openai-chat<->codex-responses`）
-- `X-Fallback-Reason`: 跨协议备用原因（`all-claude-endpoints-failed` 或 `all-codex-sources-failed`）
+- `X-Fallback-Reason`: 跨协议备用原因（`forced-by-header`、`all-claude-endpoints-failed` 或 `all-codex-sources-failed`）
 - `X-Allow-Higher-Tier-Fallback`: 是否允许向更高等级端点降级（`true/false`）
 
 说明：`X-Used-Endpoint`、`X-Endpoint-Index`、`X-Preferred-Endpoint`、`X-Format-Conversion` 主要用于 Claude/OpenAI 路由；Codex 路由重点查看 `X-Route-Type`、`X-Used-Base-URL`、`X-Base-URL-Index`。

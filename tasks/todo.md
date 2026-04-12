@@ -122,3 +122,31 @@
 
 - 目标是把“部署后才暴露问题”前移到本地开发阶段。
 - 本地预演命令：`bash scripts/verify_local_wrangler_dev.sh`。
+
+## 2026-04-12 修复 x-force-codex 流式工具回显
+
+- [x] 复现 `/v1/messages + x-force-codex + stream:true` 被错误降级为 JSON
+- [x] 新增 Codex SSE -> Claude SSE 转换（含 text/tool_use/message_delta/message_stop）
+- [x] 修复 `tryCodexAsFallback`：流式请求返回 SSE，不再返回 JSON
+- [x] 扩展验证脚本：强制 Codex 场景改为 `stream:true` 并校验 `tool_use` 事件
+- [ ] 部署后复测 Claude Code 工具调用回显
+
+### Review
+
+- 根因是 fallback 路径忽略了 Claude `stream:true` 协议语义。
+- 修复后，Claude Code 在强制 Codex 模式下可收到标准 Claude SSE 事件流。
+
+## 2026-04-13 修复 x-force-codex 强制语义与工具事件兜底
+
+- [x] 修复 `x-force-codex: true` 失败时的路由行为，禁止静默回退 Claude
+- [x] 增强 Codex SSE -> Claude SSE：`response.completed` 时兜底补齐缺失 `tool_use` 事件块
+- [x] 更新验证脚本，增加“强制 Codex 失败返回错误”的断言
+- [x] 运行语法检查、验证脚本与 `npm test` 并记录结果
+
+### Review
+
+- `tryCodexAsFallback` 现在会保留并返回最后一个 Codex 错误响应；`x-force-codex: true` 分支在 Codex 失败时直接返回该错误，不再落回 Claude 主路由。
+- `convertCodexStreamToClaude` 在 `response.completed` 事件里增加了工具调用兜底：即使上游遗漏中间 `output_item` 事件，也会补齐 `tool_use` 块后再发 `stop_reason=tool_use`。
+- `scripts/verify_codex_chat_completions.sh` 新增“无效 key + x-force-codex”断言，验证强制语义。
+- 本地验证通过：`bash scripts/verify_local_wrangler_dev.sh`。
+- 远端验证脚本失败是预期（线上仍是旧部署）；`npm test` 失败（仓库缺少 `package.json`，`ENOENT`）。

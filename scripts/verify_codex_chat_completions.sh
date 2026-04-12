@@ -23,6 +23,8 @@ tools_headers="$tmp_dir/tools.headers"
 tools_body="$tmp_dir/tools.body"
 force_tools_headers="$tmp_dir/force-tools.headers"
 force_tools_body="$tmp_dir/force-tools.body"
+force_fail_headers="$tmp_dir/force-fail.headers"
+force_fail_body="$tmp_dir/force-fail.body"
 
 echo "[1/5] Models request..."
 curl -sS \
@@ -150,7 +152,7 @@ grep -qi '^x-route-type:[[:space:]]*codex' "$tools_headers"
 grep -q '"tool_calls"' "$tools_body"
 grep -q '"finish_reason"[[:space:]]*:[[:space:]]*"tool_calls"' "$tools_body"
 
-echo "[Extra] Claude /v1/messages with x-force-codex + tools..."
+echo "[Extra] Claude /v1/messages stream + x-force-codex + tools..."
 curl -sS \
   -D "$force_tools_headers" \
   -o "$force_tools_body" \
@@ -162,6 +164,7 @@ curl -sS \
   "$BASE_URL/v1/messages" \
   -d "{
     \"model\": \"claude-sonnet-4-6\",
+    \"stream\": true,
     \"max_tokens\": 512,
     \"messages\": [{\"role\": \"user\", \"content\": \"Call get_time tool only.\"}],
     \"tools\": [{
@@ -184,7 +187,42 @@ if [[ "$force_tools_status" != "200" ]]; then
 fi
 
 grep -qi '^x-route-type:[[:space:]]*codex-fallback' "$force_tools_headers"
-grep -q '"stop_reason"[[:space:]]*:[[:space:]]*"tool_use"' "$force_tools_body"
-grep -q '"type"[[:space:]]*:[[:space:]]*"tool_use"' "$force_tools_body"
+grep -qi '^content-type:[[:space:]]*text/event-stream' "$force_tools_headers"
+grep -q 'event: content_block_start' "$force_tools_body"
+grep -q '"type":"tool_use"' "$force_tools_body"
+grep -q '"stop_reason":"tool_use"' "$force_tools_body"
 
-echo "OK: models + chat.completions(non-stream/stream/tools) + forced codex tools passed"
+echo "[Extra] Forced codex failure should NOT fallback to Claude..."
+curl -sS \
+  -D "$force_fail_headers" \
+  -o "$force_fail_body" \
+  -H "Authorization: Bearer invalid-force-codex-key" \
+  -H "x-api-key: invalid-force-codex-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-force-codex: true" \
+  -H "Content-Type: application/json" \
+  "$BASE_URL/v1/messages" \
+  -d "{
+    \"model\": \"claude-sonnet-4-6\",
+    \"stream\": false,
+    \"max_tokens\": 64,
+    \"messages\": [{\"role\": \"user\", \"content\": \"ping\"}]
+  }"
+
+force_fail_status="$(head -n 1 "$force_fail_headers" | awk '{print $2}')"
+if [[ "$force_fail_status" == "200" ]]; then
+  echo "Forced-codex failure probe unexpectedly succeeded"
+  cat "$force_fail_body"
+  exit 1
+fi
+
+grep -qi '^x-route-type:[[:space:]]*codex-fallback' "$force_fail_headers"
+grep -qi '^x-fallback-reason:[[:space:]]*forced-by-header' "$force_fail_headers"
+if grep -qi '^x-route-type:[[:space:]]*claude' "$force_fail_headers"; then
+  echo "Forced-codex failure probe incorrectly fell back to Claude route"
+  cat "$force_fail_headers"
+  cat "$force_fail_body"
+  exit 1
+fi
+
+echo "OK: models + chat.completions(non-stream/stream/tools) + forced codex tools + forced failure semantics passed"

@@ -124,6 +124,8 @@ export ANTHROPIC_API_KEY=your-api-key
 - 成功时响应头会返回 `X-Route-Type: codex-fallback`
 - 响应体仍保持 Claude Messages 兼容格式，便于 Claude Code 直接消费
 - `tools/tool_choice` 会透传到 Codex，并将工具调用回转为 Claude `tool_use`
+- 当 `stream: true` 时会保持 Claude SSE 事件流返回，避免降级为 JSON
+- 当所有 Codex 源失败时，会直接返回 Codex 错误（`X-Fallback-Reason: forced-by-header`），不再回退到 Claude 路由
 
 ## 验证配置
 
@@ -160,6 +162,7 @@ curl https://your-worker.workers.dev/claude/ultra/v1/messages \
 - `X-Used-Endpoint`: 实际使用的端点
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
 - `X-Route-Type`: 路由类型（`claude` / `codex` / `codex-fallback` / `claude-fallback`）
+- `X-Fallback-Reason`: 备用原因（`forced-by-header` / `all-claude-endpoints-failed` / `all-codex-sources-failed`）
 
 如需验证“强制走 GPT（Codex）”，可使用：
 
@@ -176,7 +179,7 @@ curl https://your-worker.workers.dev/v1/messages \
   }' -i
 ```
 
-当响应头是 `X-Route-Type: codex-fallback`，且 `model` 为 Codex 模型（如 `gpt-5.3-codex`）时，说明配置成功。
+当响应头是 `X-Route-Type: codex-fallback` 时，说明请求已按预期进入 Codex 强制链路。
 
 ## 使用指定端点路由（高级功能）
 
