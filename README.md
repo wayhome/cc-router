@@ -49,6 +49,7 @@
 **提示**：
 - Claude 默认使用自动路由，从最低价层级（ultra）开始尝试
 - Codex 统一使用 `https://your-worker.workers.dev/codex/v1/...` 路径
+- Claude Code 可通过 `x-force-codex: true` 强制走 GPT/Codex
 - 你也可以指定 Claude 特定端点，如 `https://your-worker.workers.dev/claude/ultra`
 - Claude Code 详细配置请查看 [Claude Code 配置指南](CLAUDE_CODE_SETUP.md)
 
@@ -268,6 +269,37 @@ curl https://your-worker.workers.dev/codex/v1/responses \
 - 先尝试主源 `https://code.newcli.com`，失败（4xx/5xx 或网络错误）后自动尝试备源 `https://dm-fox.rjj.cc`
 - 当两个源都失败时，自动切换到 Claude 端点作为备用（协议自动转换）
 - 如果仍然失败，优先返回最后一个上游错误响应体，保持 Codex 错误格式兼容
+
+### Claude Code 强制走 GPT（Codex）
+
+如果你希望 Claude Code 请求不走 Claude 端点，而是直接走 Codex/GPT，可在 `~/.claude/settings.json` 注入自定义头：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "your-api-key",
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev",
+    "ANTHROPIC_CUSTOM_HEADERS": "x-force-codex: true"
+  }
+}
+```
+
+验证示例：
+
+```bash
+curl https://your-worker.workers.dev/v1/messages \
+  -H "x-api-key: your-api-key" \
+  -H "Authorization: Bearer your-api-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-force-codex: true" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "messages": [{"role": "user", "content": "ping"}]
+  }' -i
+```
+
+返回头中出现 `X-Route-Type: codex-fallback` 即表示已走 GPT/Codex。
 
 ## 调试
 

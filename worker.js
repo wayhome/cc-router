@@ -1004,32 +1004,178 @@ function convertClaudeToCodexRequest(claudeRequest) {
   }
 
   codexRequest.input = inputParts.join('\n\n');
-  if (claudeRequest.max_tokens) codexRequest.max_tokens = claudeRequest.max_tokens;
-  if (claudeRequest.temperature) codexRequest.temperature = claudeRequest.temperature;
+  if (claudeRequest.max_tokens !== undefined) codexRequest.max_output_tokens = claudeRequest.max_tokens;
+  if (claudeRequest.temperature !== undefined) codexRequest.temperature = claudeRequest.temperature;
   if (claudeRequest.stream !== undefined) codexRequest.stream = claudeRequest.stream;
 
   return codexRequest;
+}
+
+function extractCodexOutputText(codexResponse) {
+  if (!codexResponse) return '';
+
+  if (typeof codexResponse.output === 'string') {
+    return codexResponse.output;
+  }
+
+  if (typeof codexResponse.output_text === 'string') {
+    return codexResponse.output_text;
+  }
+
+  if (Array.isArray(codexResponse.output)) {
+    const chunks = [];
+
+    for (const item of codexResponse.output) {
+      if (!item) continue;
+
+      if (typeof item === 'string') {
+        chunks.push(item);
+        continue;
+      }
+
+      if (typeof item.text === 'string') {
+        chunks.push(item.text);
+      }
+
+      if (Array.isArray(item.content)) {
+        for (const part of item.content) {
+          if (!part) continue;
+          if (typeof part.text === 'string') {
+            chunks.push(part.text);
+          }
+        }
+      }
+    }
+
+    if (chunks.length > 0) {
+      return chunks.join('');
+    }
+  }
+
+  const choiceContent = codexResponse.choices?.[0]?.message?.content;
+  if (typeof choiceContent === 'string') {
+    return choiceContent;
+  }
+
+  if (Array.isArray(choiceContent)) {
+    return choiceContent.map(part => part?.text || '').join('');
+  }
+
+  return '';
 }
 
 /**
  * 转换 Codex Responses API 响应为 Claude Messages API 格式
  */
 function convertCodexResponseToClaude(codexResponse) {
+  const usage = codexResponse.usage || {};
+
   return {
     id: codexResponse.id || `msg-${Date.now()}`,
     type: 'message',
     role: 'assistant',
     content: [{
       type: 'text',
-      text: codexResponse.output || codexResponse.choices?.[0]?.message?.content || ''
+      text: extractCodexOutputText(codexResponse)
     }],
     model: codexResponse.model,
     stop_reason: 'end_turn',
     usage: {
-      input_tokens: codexResponse.usage?.prompt_tokens || 0,
-      output_tokens: codexResponse.usage?.completion_tokens || 0
+      input_tokens: usage.prompt_tokens ?? usage.input_tokens ?? 0,
+      output_tokens: usage.completion_tokens ?? usage.output_tokens ?? 0
     }
   };
+}
+
+async function parseCodexSSEToResponse(stream) {
+  if (!stream) {
+    throw new Error('Codex SSE stream body is empty');
+  }
+
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let outputText = '';
+  let completedResponse = null;
+
+  const applyEventPayload = (eventType, rawPayload) => {
+    if (!rawPayload || rawPayload === '[DONE]') return;
+
+    try {
+      const payload = JSON.parse(rawPayload);
+      const type = payload.type || eventType;
+
+      if (type === 'response.output_text.delta' && typeof payload.delta === 'string') {
+        outputText += payload.delta;
+      } else if (type === 'response.output_text.done' && !outputText && typeof payload.text === 'string') {
+        outputText = payload.text;
+      } else if (type === 'response.completed' && payload.response) {
+        completedResponse = payload.response;
+      }
+    } catch (error) {
+      // 忽略无法解析的事件，继续处理后续事件
+    }
+  };
+
+  const processBuffer = (flush = false) => {
+    const lines = buffer.split('\n');
+    if (!flush) {
+      buffer = lines.pop() || '';
+    } else {
+      buffer = '';
+    }
+
+    let eventType = '';
+    let dataLines = [];
+
+    const commitEvent = () => {
+      if (dataLines.length === 0) return;
+      applyEventPayload(eventType, dataLines.join('\n'));
+      eventType = '';
+      dataLines = [];
+    };
+
+    for (const rawLine of lines) {
+      const line = rawLine.replace(/\r$/, '');
+
+      if (line === '') {
+        commitEvent();
+        continue;
+      }
+
+      if (line.startsWith('event:')) {
+        eventType = line.slice(6).trim();
+        continue;
+      }
+
+      if (line.startsWith('data:')) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+
+    if (flush) {
+      commitEvent();
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    processBuffer(false);
+  }
+
+  buffer += decoder.decode();
+  processBuffer(true);
+
+  const codexResponse = completedResponse ? { ...completedResponse } : {};
+  if (!codexResponse.id) codexResponse.id = `resp-${Date.now()}`;
+  if (!codexResponse.model) codexResponse.model = 'gpt-5.3-codex';
+  if (!extractCodexOutputText(codexResponse) && outputText) {
+    codexResponse.output = outputText;
+  }
+
+  return codexResponse;
 }
 
 /**
@@ -1060,8 +1206,13 @@ async function tryCodexAsFallback(request, manager) {
   try {
     const claudeBody = await request.clone().json();
     const codexBody = convertClaudeToCodexRequest(claudeBody);
+    if (codexBody.stream === undefined) {
+      // Claude 非流式请求默认转为 Codex 非流式，避免上游返回 SSE 导致 JSON 解析失败。
+      codexBody.stream = false;
+    }
     const requestHeaders = new Headers(request.headers);
     requestHeaders.set('Content-Type', 'application/json');
+    requestHeaders.set('Accept', 'application/json');
 
     for (let baseUrlIndex = 0; baseUrlIndex < TARGET_BASE_URLS.length; baseUrlIndex++) {
       try {
@@ -1074,7 +1225,10 @@ async function tryCodexAsFallback(request, manager) {
 
         const response = await fetch(codexRequest);
         if (response.status < 400) {
-          const codexResponse = await response.json();
+          const contentType = (response.headers.get('content-type') || '').toLowerCase();
+          const codexResponse = contentType.includes('text/event-stream')
+            ? await parseCodexSSEToResponse(response.body)
+            : await response.json();
           const claudeResponse = convertCodexResponseToClaude(codexResponse);
 
           return {

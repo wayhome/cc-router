@@ -105,6 +105,25 @@ export ANTHROPIC_API_KEY=your-api-key
 说明：开启后会允许继续尝试更高等级端点。  
 `ANTHROPIC_CUSTOM_HEADERS` 格式：`"Header1: value1\nHeader2: value2"`。
 
+### 4) 强制走 GPT（Codex）
+
+如果希望 Claude Code 直接走 GPT/Codex 路由，可配置：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "your-api-key",
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev",
+    "ANTHROPIC_CUSTOM_HEADERS": "x-force-codex: true"
+  }
+}
+```
+
+行为：
+- 优先走 Codex 路由（`/codex/v1/responses`）
+- 成功时响应头会返回 `X-Route-Type: codex-fallback`
+- 响应体仍保持 Claude Messages 兼容格式，便于 Claude Code 直接消费
+
 ## 验证配置
 
 测试连接：
@@ -139,6 +158,24 @@ curl https://your-worker.workers.dev/claude/ultra/v1/messages \
 查看响应头中的调试信息：
 - `X-Used-Endpoint`: 实际使用的端点
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
+- `X-Route-Type`: 路由类型（`claude` / `codex` / `codex-fallback` / `claude-fallback`）
+
+如需验证“强制走 GPT（Codex）”，可使用：
+
+```bash
+curl https://your-worker.workers.dev/v1/messages \
+  -H "x-api-key: your-api-key" \
+  -H "Authorization: Bearer your-api-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-force-codex: true" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "messages": [{"role": "user", "content": "ping"}]
+  }' -i
+```
+
+当响应头是 `X-Route-Type: codex-fallback`，且 `model` 为 Codex 模型（如 `gpt-5.3-codex`）时，说明配置成功。
 
 ## 使用指定端点路由（高级功能）
 
