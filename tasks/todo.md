@@ -1,5 +1,27 @@
 # TODO
 
+## 2026-05-02 刷新 README 当前行为说明
+
+- [x] 对照 `src/config.js`、`src/paths.js`、`src/utils.js` 校验 README 路由说明
+- [x] 更新 README 中容易过时或容易误解的路由、fallback、模型与验证说明
+- [x] 更新 `tasks/lessons.md` 记录这次文档滞后问题
+- [x] 执行文档检查与必要验证，并记录结果
+
+### 验收标准
+
+- [x] README 明确区分 Claude 兼容 `/codex/v1/messages` 与原生 Codex `/codex/v1/*`
+- [x] README 的默认和指定端点尝试顺序与 `buildEndpointAttemptOrder` 一致
+- [x] README 不再保留旧跨协议 fallback、`/claude/droid` 或 `gpt-5-codex` 相关误导
+
+### Review
+
+- README 已刷新简介、功能特性、快速开始、使用方法、Codex 路由、本地预演和路由摘要，明确 `/codex/v1/messages` 是 Claude 兼容端点，原生 Codex 只覆盖 `/responses`、`/chat/completions`、`/images/generations`、`/models` 和 `/models/{model}`。
+- README 的默认顺序、显式端点顺序和 `x-ccr-tier: true` 行为已按 `buildEndpointAttemptOrder` 对齐。
+- 已移除 README 中旧的跨协议 fallback、`/claude/droid`、`gpt-5-codex` 相关字样。
+- 已更新 `tasks/lessons.md`，记录 `/codex` 双重含义需要在文档中明确区分。
+- `git diff --check` 通过；旧术语扫描未命中；路由/顺序断言通过。
+- 本次只改 Markdown，未修改 JavaScript，因此未运行 `npm test`。
+
 ## 2026-05-01 更正 Codex 模型列表并删除 Droid
 
 - [x] 移除 Codex 模型 `gpt-5-codex`
