@@ -1,5 +1,180 @@
 # TODO
 
+## 2026-05-01 更正 Codex 模型列表并删除 Droid
+
+- [x] 移除 Codex 模型 `gpt-5-codex`
+- [x] 加入 Codex 模型 `gpt-5.2` 与 `gpt-5.5`
+- [x] 收紧 `/claude` 端点匹配，确保 `/claude/droid/...` 不再作为兼容路径
+- [x] 更新 README、验证脚本与 lessons
+- [x] 执行路径/模型断言、语法检查、本地预演、Wrangler dry-run 与 `npm test`
+
+### 验收标准
+
+- [x] `/codex/v1/models` 包含 `gpt-5.2`、`gpt-5.3-codex`、`gpt-5.4`、`gpt-5.5`、`gpt-image-2`
+- [x] `/codex/v1/models` 不包含 `gpt-5-codex`
+- [x] `/claude/droid/v1/messages` 不再识别为端点兼容路径
+
+### Review
+
+- `src/config.js` 已将 Codex 文本模型更正为 `gpt-5.2`、`gpt-5.3-codex`、`gpt-5.4`、`gpt-5.5`，并保留图片模型 `gpt-image-2`；已移除 `gpt-5-codex`。
+- `scripts/verify_codex_chat_completions.sh` 已断言模型列表包含 `gpt-5.2/gpt-5.3-codex/gpt-5.4/gpt-5.5/gpt-image-2`，且不包含 `gpt-5-codex`。
+- `src/paths.js` 已删除旧兼容端点列表，并收紧 `/claude` 匹配；路径断言确认 `/claude/droid/v1/messages` 解析为普通默认路径，`preferredEndpoint: null`。
+- README 示例已从 `gpt-5-codex` 改为 `gpt-5.3-codex`，Codex 模型说明已同步。
+- 已按用户更正更新 `tasks/lessons.md`。
+- 语法检查通过：所有 `src/*.js`、`src/conversions/*.js` 均通过 `node --check`；验证脚本通过 `bash -n`。
+- 本地预演通过：`bash scripts/verify_local_wrangler_dev.sh`。
+- `wrangler deploy --dry-run` 通过，上传体积约 `61.02 KiB`，gzip 约 `11.80 KiB`；仍有 Wrangler 默认日志目录 EPERM 警告但不影响打包结果。
+- `npm test` 失败：仓库没有 `package.json`，npm 返回 `ENOENT`。
+
+## 2026-05-01 删除 Claude Droid 兼容路径
+
+- [x] 从配置中删除 `/claude/droid` 旧路径兼容
+- [x] 删除文档中的 `/claude/droid` 说明
+- [x] 执行路径断言、语法检查、Wrangler dry-run、本地预演与 `npm test`
+
+### 验收标准
+
+- [x] `/claude/droid/v1/messages` 不再识别为端点兼容路径
+- [x] 运行时代码和用户文档不再出现 `/claude/droid`
+
+### Review
+
+- `src/config.js` 已删除旧兼容端点列表，不再保留 `/claude/droid`。
+- `src/paths.js` 已移除旧兼容路径解析循环，并收紧 `/claude` 端点前缀匹配，避免 `/claude/droid/...` 被误识别为 `/claude`。
+- CLAUDE_CODE_SETUP 已删除 `/claude/droid` 兼容说明。
+- 路径断言通过：`/claude/droid/v1/messages` 不再有 `preferredEndpoint`。
+- 语法检查、本地预演和 Wrangler dry-run 结果见上一节 Review。
+
+## 2026-05-01 支持 Codex Images Generations
+
+- [x] 确认 `/codex/v1/images/generations` 走原生 Codex 透传路由
+- [x] 将 `gpt-image-2` 加入 Codex 模型列表与模型详情
+- [x] 更新 README，补充文生图调用示例与路由说明
+- [x] 更新验证脚本，覆盖模型枚举并提供可选图片生成探测
+- [x] 执行路径断言、语法检查、Wrangler dry-run、本地预演与 `npm test`
+
+### 验收标准
+
+- [x] `/codex/v1/images/generations` 不进入 Claude 兼容路由
+- [x] `/codex/v1/models` 包含 `gpt-image-2`
+- [x] `/codex/v1/models/gpt-image-2` 返回 200
+- [x] 默认本地回归不触发真实图片生成
+
+### Review
+
+- 现有原生 Codex 透传已覆盖 `/codex/v1/images/generations`；路径断言确认该路径解析为 `routeType: "codex"`，不会进入 Claude 兼容 `/codex/v1/messages` 分支。
+- `src/config.js` 已加入 `gpt-image-2`，并为其返回 `modalities/input_modalities/output_modalities` 元数据。
+- README 已补充 `gpt-image-2` 文生图 curl 示例和 `/codex/v1/images/generations` 行为说明；CLAUDE_CODE_SETUP 已同步原生 Codex 路由列表。
+- `scripts/verify_codex_chat_completions.sh` 已校验 `/codex/v1/models` 包含 `gpt-image-2`，并校验 `/codex/v1/models/gpt-image-2`；真实图片生成仅在 `CCR_VERIFY_IMAGES=true` 时执行。
+- 本地预演通过：`bash scripts/verify_local_wrangler_dev.sh`，未触发真实图片生成。
+- 语法检查通过：所有 `src/*.js`、`src/conversions/*.js` 均通过 `node --check`；验证脚本通过 `bash -n`。
+- `wrangler deploy --dry-run` 通过，上传体积约 `60.91 KiB`，gzip 约 `11.77 KiB`；仍有 Wrangler 默认日志目录 EPERM 警告但不影响打包结果。
+- `npm test` 失败：仓库没有 `package.json`，npm 返回 `ENOENT`。
+
+## 2026-05-01 插入 Claude Super 节点
+
+- [x] 在 `/claude/turbo` 和 `/claude` 之间加入 `/claude/super`
+- [x] 保持默认自动路由上限仍为 `/claude/ultra`
+- [x] 更新 README、CLAUDE_CODE_SETUP 与任务记录中的端点顺序
+- [x] 执行端点顺序断言、语法检查、Wrangler dry-run、本地预演与 `npm test`
+
+### 验收标准
+
+- [x] `x-ccr-tier: true` 时完整顺序为 `/claude/aws -> /codex -> /claude/ultra -> /claude/turbo -> /claude/super -> /claude`
+- [x] 默认顺序仍为 `/claude/aws -> /codex -> /claude/ultra`
+- [x] `/claude/super` 不再位于旧路径兼容列表
+
+### Review
+
+- `src/config.js` 已将 `/claude/super` 插入 `/claude/turbo` 和 `/claude` 之间，层级为 4。
+- 默认自动路由仍为 `/claude/aws -> /codex -> /claude/ultra`。
+- `x-ccr-tier: true` 完整顺序为 `/claude/aws -> /codex -> /claude/ultra -> /claude/turbo -> /claude/super -> /claude`。
+- README 与 CLAUDE_CODE_SETUP 已同步价格顺序、固定 super 起步示例和 `X-Endpoint-Index`。
+- 语法检查通过：所有 `src/*.js`、`src/conversions/*.js` 均通过 `node --check`；验证脚本通过 `bash -n`。
+- `wrangler deploy --dry-run` 通过，上传体积约 `60.78 KiB`，gzip 约 `11.74 KiB`；仍有 Wrangler 默认日志目录 EPERM 警告但不影响打包结果。
+- 本地预演通过：`bash scripts/verify_local_wrangler_dev.sh`。
+- `npm test` 失败：仓库没有 `package.json`，npm 返回 `ENOENT`。
+
+## 2026-05-01 默认自动升级到 Ultra
+
+- [x] 修改默认 Claude 自动路由顺序为 `/claude/aws -> /codex -> /claude/ultra`
+- [x] 保持 `x-ccr-tier: true` 时才允许继续尝试 `/claude/turbo` 与 `/claude`
+- [x] 保持显式指定端点的既有层级限制语义
+- [x] 更新 README 与 CLAUDE_CODE_SETUP 的默认行为说明
+- [x] 执行端点顺序断言、语法检查、Wrangler dry-run、本地预演与 `npm test`
+
+### 验收标准
+
+- [x] 默认 Claude 路由会从 aws 开始，并在失败时最多自动升级到 ultra
+- [x] 默认 Claude 路由不会尝试 turbo 或 claude
+- [x] `x-ccr-tier: true` 仍可放开到完整顺序
+
+### Review
+
+- `src/utils.js` 已新增默认自动路由上限 `/claude/ultra`：无指定端点且未设置 `x-ccr-tier` 时，尝试顺序为 `/claude/aws -> /codex -> /claude/ultra`。
+- `x-ccr-tier: true` 仍会放开完整顺序：`/claude/aws -> /codex -> /claude/ultra -> /claude/turbo -> /claude/super -> /claude`。
+- 显式指定端点保持既有层级限制：例如 `/codex` 为 `/codex -> /claude/aws`，`/claude/turbo` 为 `/claude/turbo -> /claude/aws -> /codex -> /claude/ultra`。
+- README 与 CLAUDE_CODE_SETUP 已同步默认最多升到 ultra、`x-ccr-tier` 才继续到 turbo/super/claude 的说明。
+- 语法检查通过：所有 `src/*.js`、`src/conversions/*.js` 均通过 `node --check`；验证脚本通过 `bash -n`。
+- `wrangler deploy --dry-run` 通过，上传体积约 `60.76 KiB`，gzip 约 `11.73 KiB`；仍有 Wrangler 默认日志目录 EPERM 警告但不影响打包结果。
+- 本地预演通过：`bash scripts/verify_local_wrangler_dev.sh`。
+- `npm test` 失败：仓库没有 `package.json`，npm 返回 `ENOENT`。
+
+## 2026-05-01 更新 Claude 可用节点顺序
+
+- [x] 将 Claude 兼容端点顺序改为 `/claude/aws`、`/codex`、`/claude/ultra`、`/claude/turbo`、`/claude/super`、`/claude`
+- [x] 保持原 Codex 客户端路由 `/codex/v1` 不变
+- [x] 让 `/codex/v1/messages` 作为 Claude 兼容端点 `/codex` 转发，而不是进入原 Codex 客户端路由
+- [x] 更新 README 与 CLAUDE_CODE_SETUP 中的端点顺序、示例和调试索引
+- [x] 执行语法检查、路径解析断言、Wrangler dry-run、本地预演与 `npm test` 并记录结果
+
+### 验收标准
+
+- [x] 默认 Claude 路由从 `/claude/aws` 开始
+- [x] 启用 `x-ccr-tier: true` 后按 `/claude/aws -> /codex -> /claude/ultra -> /claude/turbo -> /claude/super -> /claude` 尝试
+- [x] `/codex/v1/responses`、`/codex/v1/chat/completions`、`/codex/v1/models` 仍是原 Codex 客户端路由
+- [x] `/codex/v1/messages` 被识别为 Claude 兼容 `/codex` 端点
+
+### Review
+
+- `src/config.js` 已更新 Claude 兼容端点顺序：`/claude/aws`、`/codex`、`/claude/ultra`、`/claude/turbo`、`/claude/super`、`/claude`。
+- `src/paths.js` 已特殊处理 `/codex/v1/messages` 与其子路径，让 Claude 客户端以 `/codex` 为 base URL 时进入 Claude 路由；原生 Codex 的 `/codex/v1/responses`、`/codex/v1/chat/completions`、`/codex/v1/models` 保持不变。
+- 路径断言通过：`/codex/v1/messages` 解析为 `{ routeType: "claude", preferredEndpoint: "/codex", apiPath: "/v1/messages" }`；原生 Codex 三个路径仍解析为 `routeType: "codex"`。
+- 端点顺序断言通过：默认仅 `/claude/aws`；开启 `x-ccr-tier` 后为 `/claude/aws -> /codex -> /claude/ultra -> /claude/turbo -> /claude/super -> /claude`。
+- README 与 CLAUDE_CODE_SETUP 已同步端点顺序、`/codex` 双重含义和调试索引。
+- 语法检查通过：所有 `src/*.js`、`src/conversions/*.js` 均通过 `node --check`；验证脚本通过 `bash -n`。
+- `wrangler deploy --dry-run` 通过，上传体积约 `60.69 KiB`，gzip 约 `11.71 KiB`；仍有 Wrangler 默认日志目录 EPERM 警告但不影响打包结果。
+- 本地预演通过：`bash scripts/verify_local_wrangler_dev.sh`。
+- `npm test` 失败：仓库没有 `package.json`，npm 返回 `ENOENT`。
+
+## 2026-05-01 拆分 Worker 并移除 Claude/Codex 互转
+
+- [x] 将 `worker.js` 拆成 `src/` 下的模块化源码
+- [x] 调整 `wrangler.toml`，让 Cloudflare/Wrangler 部署时从模块入口编译打包
+- [x] 移除 Claude -> Codex 与 Codex -> Claude 的跨协议备用转换逻辑
+- [x] 保留 Claude 路由、Codex 路由、OpenAI Chat 兼容转换等仍需要的能力
+- [x] 更新 README、Claude Code 说明和本地验证脚本，删除旧的 `x-force-codex`/`x-force-claude` 互转说明
+- [x] 执行语法检查、本地验证脚本与 `npm test`，记录结果
+
+### 验收标准
+
+- [x] 源码不再是单个几千行 `worker.js`
+- [x] 部署入口使用模块化 Worker，Wrangler 可在部署时完成依赖打包
+- [x] Claude 源全部失败时返回 Claude 路由错误，不再转 Codex
+- [x] Codex 源全部失败时返回 Codex 路由错误，不再转 Claude
+- [x] Codex `/responses` 继续透传，`/chat/completions` 继续提供 OpenAI Chat 兼容
+- [x] 文档与脚本不再验证或宣传 Claude/Codex 互相转换
+
+### Review
+
+- 已删除根目录 3292 行 `worker.js`，改为 `src/worker.js` 入口和 `src/config.js`、`src/health.js`、`src/proxy.js`、`src/paths.js`、`src/models.js`、`src/utils.js`、`src/conversions/*` 等模块。
+- `wrangler.toml` 已改为 `main = "src/worker.js"`；`wrangler deploy --dry-run` 通过，Wrangler 可部署时打包模块入口。
+- 已移除 `x-force-codex`/`x-force-claude`、`tryCodexAsFallback`、`tryClaudeAsFallback` 以及 Claude/Codex 互转函数；Claude 与 Codex 路由现在彼此独立失败。
+- README、CLAUDE_CODE_SETUP 和验证脚本已删除旧的跨协议 fallback 说明与断言。
+- 语法检查通过：所有 `src/*.js`、`src/conversions/*.js` 均通过 `node --check`；验证脚本通过 `bash -n`。
+- 本地预演通过：`bash scripts/verify_local_wrangler_dev.sh`。
+- `npm test` 失败：仓库没有 `package.json`，npm 返回 `ENOENT`。
+
 - [x] 识别并解析 Codex 请求路径（`/codex/v1` 前缀）
 - [x] 为 Codex 增加“单端点 + 主备源”重试流程（覆盖 4xx/5xx 与网络异常）
 - [x] 保持 Codex 请求与响应透传兼容（不做格式转换）

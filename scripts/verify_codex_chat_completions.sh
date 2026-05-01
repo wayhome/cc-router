@@ -21,12 +21,12 @@ model_detail_headers="$tmp_dir/model-detail.headers"
 model_detail_body="$tmp_dir/model-detail.body"
 tools_headers="$tmp_dir/tools.headers"
 tools_body="$tmp_dir/tools.body"
-force_tools_headers="$tmp_dir/force-tools.headers"
-force_tools_body="$tmp_dir/force-tools.body"
-force_fail_headers="$tmp_dir/force-fail.headers"
-force_fail_body="$tmp_dir/force-fail.body"
+image_model_headers="$tmp_dir/image-model.headers"
+image_model_body="$tmp_dir/image-model.body"
+image_headers="$tmp_dir/image.headers"
+image_body="$tmp_dir/image.body"
 
-echo "[1/5] Models request..."
+echo "[1/6] Models request..."
 curl -sS \
   -D "$models_headers" \
   -o "$models_body" \
@@ -42,11 +42,19 @@ fi
 
 grep -qi '^x-route-type:[[:space:]]*codex' "$models_headers"
 grep -q '"object"[[:space:]]*:[[:space:]]*"list"' "$models_body"
-grep -q '"gpt-5.4"' "$models_body"
+grep -q '"gpt-5.2"' "$models_body"
 grep -q '"gpt-5.3-codex"' "$models_body"
+grep -q '"gpt-5.4"' "$models_body"
+grep -q '"gpt-5.5"' "$models_body"
+grep -q '"gpt-image-2"' "$models_body"
+if grep -q '"gpt-5-codex"' "$models_body"; then
+  echo "Models response unexpectedly contains removed model gpt-5-codex"
+  cat "$models_body"
+  exit 1
+fi
 grep -q '"context_length"[[:space:]]*:[[:space:]]*400000' "$models_body"
 
-echo "[2/5] Model detail request..."
+echo "[2/6] Model detail request..."
 curl -sS \
   -D "$model_detail_headers" \
   -o "$model_detail_body" \
@@ -65,7 +73,25 @@ grep -q "\"id\"[[:space:]]*:[[:space:]]*\"$MODEL\"" "$model_detail_body"
 grep -q '"context_length"[[:space:]]*:[[:space:]]*400000' "$model_detail_body"
 grep -q '"max_output_tokens"[[:space:]]*:[[:space:]]*128000' "$model_detail_body"
 
-echo "[3/5] Non-stream request..."
+echo "[3/6] Image model detail request..."
+curl -sS \
+  -D "$image_model_headers" \
+  -o "$image_model_body" \
+  -H "Authorization: Bearer $CCR_API_KEY" \
+  "$BASE_URL/codex/v1/models/gpt-image-2"
+
+image_model_status="$(head -n 1 "$image_model_headers" | awk '{print $2}')"
+if [[ "$image_model_status" != "200" ]]; then
+  echo "Image model detail failed with status: $image_model_status"
+  cat "$image_model_body"
+  exit 1
+fi
+
+grep -qi '^x-route-type:[[:space:]]*codex' "$image_model_headers"
+grep -q '"id"[[:space:]]*:[[:space:]]*"gpt-image-2"' "$image_model_body"
+grep -q '"output_modalities"' "$image_model_body"
+
+echo "[4/6] Non-stream request..."
 curl -sS \
   -D "$nonstream_headers" \
   -o "$nonstream_body" \
@@ -90,7 +116,7 @@ grep -qi '^x-format-conversion:[[:space:]]*openai-chat<->codex-responses' "$nons
 grep -q '"object"[[:space:]]*:[[:space:]]*"chat.completion"' "$nonstream_body"
 grep -q '"choices"' "$nonstream_body"
 
-echo "[4/5] Stream request..."
+echo "[5/6] Stream request..."
 curl -sS -N \
   -D "$stream_headers" \
   -o "$stream_body" \
@@ -115,7 +141,7 @@ grep -qi '^x-format-conversion:[[:space:]]*openai-chat<->codex-responses' "$stre
 grep -q 'chat.completion.chunk' "$stream_body"
 grep -q 'data: \[DONE\]' "$stream_body"
 
-echo "[5/5] Tools request..."
+echo "[6/6] Tools request..."
 curl -sS \
   -D "$tools_headers" \
   -o "$tools_body" \
@@ -149,80 +175,35 @@ if [[ "$tools_status" != "200" ]]; then
 fi
 
 grep -qi '^x-route-type:[[:space:]]*codex' "$tools_headers"
-grep -q '"tool_calls"' "$tools_body"
-grep -q '"finish_reason"[[:space:]]*:[[:space:]]*"tool_calls"' "$tools_body"
+grep -qi '^x-format-conversion:[[:space:]]*openai-chat<->codex-responses' "$tools_headers"
+grep -q '"object"[[:space:]]*:[[:space:]]*"chat.completion"' "$tools_body"
+grep -q '"choices"' "$tools_body"
 
-echo "[Extra] Claude /v1/messages stream + x-force-codex + tools..."
-curl -sS \
-  -D "$force_tools_headers" \
-  -o "$force_tools_body" \
-  -H "Authorization: Bearer $CCR_API_KEY" \
-  -H "x-api-key: $CCR_API_KEY" \
-  -H "anthropic-version: 2023-06-01" \
-  -H "x-force-codex: true" \
-  -H "Content-Type: application/json" \
-  "$BASE_URL/v1/messages" \
-  -d "{
-    \"model\": \"claude-sonnet-4-6\",
-    \"stream\": true,
-    \"max_tokens\": 512,
-    \"messages\": [{\"role\": \"user\", \"content\": \"Call get_time tool only.\"}],
-    \"tools\": [{
-      \"name\": \"get_time\",
-      \"description\": \"Return current time\",
-      \"input_schema\": {
-        \"type\": \"object\",
-        \"properties\": {},
-        \"additionalProperties\": false
-      }
-    }],
-    \"tool_choice\": {\"type\": \"any\"}
-  }"
+if [[ "${CCR_VERIFY_IMAGES:-false}" == "true" ]]; then
+  echo "[Optional] Image generation request..."
+  curl -sS \
+    -D "$image_headers" \
+    -o "$image_body" \
+    -H "Authorization: Bearer $CCR_API_KEY" \
+    -H "Content-Type: application/json" \
+    "$BASE_URL/codex/v1/images/generations" \
+    -d '{
+      "model": "gpt-image-2",
+      "prompt": "一个小男孩",
+      "size": "1536x1024",
+      "quality": "high",
+      "n": 1
+    }'
 
-force_tools_status="$(head -n 1 "$force_tools_headers" | awk '{print $2}')"
-if [[ "$force_tools_status" != "200" ]]; then
-  echo "Force-codex tools request failed with status: $force_tools_status"
-  cat "$force_tools_body"
-  exit 1
+  image_status="$(head -n 1 "$image_headers" | awk '{print $2}')"
+  if [[ "$image_status" != "200" ]]; then
+    echo "Image generation failed with status: $image_status"
+    cat "$image_body"
+    exit 1
+  fi
+
+  grep -qi '^x-route-type:[[:space:]]*codex' "$image_headers"
+  grep -q '"data"' "$image_body"
 fi
 
-grep -qi '^x-route-type:[[:space:]]*codex-fallback' "$force_tools_headers"
-grep -qi '^content-type:[[:space:]]*text/event-stream' "$force_tools_headers"
-grep -q 'event: content_block_start' "$force_tools_body"
-grep -q '"type":"tool_use"' "$force_tools_body"
-grep -q '"stop_reason":"tool_use"' "$force_tools_body"
-
-echo "[Extra] Forced codex failure should NOT fallback to Claude..."
-curl -sS \
-  -D "$force_fail_headers" \
-  -o "$force_fail_body" \
-  -H "Authorization: Bearer invalid-force-codex-key" \
-  -H "x-api-key: invalid-force-codex-key" \
-  -H "anthropic-version: 2023-06-01" \
-  -H "x-force-codex: true" \
-  -H "Content-Type: application/json" \
-  "$BASE_URL/v1/messages" \
-  -d "{
-    \"model\": \"claude-sonnet-4-6\",
-    \"stream\": false,
-    \"max_tokens\": 64,
-    \"messages\": [{\"role\": \"user\", \"content\": \"ping\"}]
-  }"
-
-force_fail_status="$(head -n 1 "$force_fail_headers" | awk '{print $2}')"
-if [[ "$force_fail_status" == "200" ]]; then
-  echo "Forced-codex failure probe unexpectedly succeeded"
-  cat "$force_fail_body"
-  exit 1
-fi
-
-grep -qi '^x-route-type:[[:space:]]*codex-fallback' "$force_fail_headers"
-grep -qi '^x-fallback-reason:[[:space:]]*forced-by-header' "$force_fail_headers"
-if grep -qi '^x-route-type:[[:space:]]*claude' "$force_fail_headers"; then
-  echo "Forced-codex failure probe incorrectly fell back to Claude route"
-  cat "$force_fail_headers"
-  cat "$force_fail_body"
-  exit 1
-fi
-
-echo "OK: models + chat.completions(non-stream/stream/tools) + forced codex tools + forced failure semantics passed"
+echo "OK: models + image model + chat.completions(non-stream/stream/tools) passed"

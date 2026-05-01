@@ -29,7 +29,7 @@
 - 使用 `ANTHROPIC_AUTH_TOKEN` 而不是 `apiKey`
 - 使用 `ANTHROPIC_BASE_URL` 而不是 `apiUrl`
 - 配置文件位置是 `~/.claude/settings.json`
-- 默认配置使用自动路由，Worker 会从最低价层级（ultra）开始尝试，且默认不自动升级到更高等级端点
+- 默认配置使用自动路由，Worker 会从最低价层级（aws）开始尝试，不可用时最多自动升级到 ultra
 
 **高级配置**：你也可以指定特定端点作为基础 URL：
 
@@ -37,12 +37,12 @@
 {
   "env": {
     "ANTHROPIC_AUTH_TOKEN": "替换为您的API Key",
-    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev/claude/ultra"
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev/codex"
   }
 }
 ```
 
-这样配置后，所有请求都会优先使用 ultra 端点；默认只会在同层级内尝试（仅 ultra）。
+这样配置后，所有请求都会优先使用 foxcode 官方 Claude 兼容 Codex 端点；默认还会向更便宜的 aws 端点降级。
 
 #### VSCode 扩展配置
 
@@ -80,15 +80,18 @@ export ANTHROPIC_API_KEY=your-api-key
 }
 ```
 
-行为：`ultra`，不会自动升到 `super/claude`。
+行为：`aws -> codex -> ultra`，不会自动升到 `turbo/super/claude`。
 
 ### 2) 固定从指定端点开始
 
 把 `ANTHROPIC_BASE_URL` 改成以下之一：
 
-- `https://your-worker.workers.dev/claude/ultra`（`ultra`）
-- `https://your-worker.workers.dev/claude/super`（`super -> ultra`）
-- `https://your-worker.workers.dev/claude`（`claude -> ultra -> super`）
+- `https://your-worker.workers.dev/claude/aws`（`aws`）
+- `https://your-worker.workers.dev/codex`（`codex -> aws`）
+- `https://your-worker.workers.dev/claude/ultra`（`ultra -> aws -> codex`）
+- `https://your-worker.workers.dev/claude/turbo`（`turbo -> aws -> codex -> ultra`）
+- `https://your-worker.workers.dev/claude/super`（`super -> aws -> codex -> ultra -> turbo`）
+- `https://your-worker.workers.dev/claude`（`claude -> aws -> codex -> ultra -> turbo -> super`）
 
 ### 3) 允许更高等级端点（按需开启）
 
@@ -104,28 +107,6 @@ export ANTHROPIC_API_KEY=your-api-key
 
 说明：开启后会允许继续尝试更高等级端点。  
 `ANTHROPIC_CUSTOM_HEADERS` 格式：`"Header1: value1\nHeader2: value2"`。
-
-### 4) 强制走 GPT（Codex）
-
-如果希望 Claude Code 直接走 GPT/Codex 路由，可配置：
-
-```json
-{
-  "env": {
-    "ANTHROPIC_AUTH_TOKEN": "your-api-key",
-    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev",
-    "ANTHROPIC_CUSTOM_HEADERS": "x-force-codex: true"
-  }
-}
-```
-
-行为：
-- 优先走 Codex 路由（`/codex/v1/responses`）
-- 成功时响应头会返回 `X-Route-Type: codex-fallback`
-- 响应体仍保持 Claude Messages 兼容格式，便于 Claude Code 直接消费
-- `tools/tool_choice` 会透传到 Codex，并将工具调用回转为 Claude `tool_use`
-- 当 `stream: true` 时会保持 Claude SSE 事件流返回，避免降级为 JSON
-- 当所有 Codex 源失败时，会直接返回 Codex 错误（`X-Fallback-Reason: forced-by-header`），不再回退到 Claude 路由
 
 ## 验证配置
 
@@ -146,8 +127,8 @@ curl https://your-worker.workers.dev/v1/messages \
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 
-# 或指定优先端点（如 ultra）
-curl https://your-worker.workers.dev/claude/ultra/v1/messages \
+# 或指定优先端点（如 foxcode 官方 Claude 兼容 Codex）
+curl https://your-worker.workers.dev/codex/v1/messages \
   -H "x-api-key: your-api-key" \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
@@ -161,25 +142,7 @@ curl https://your-worker.workers.dev/claude/ultra/v1/messages \
 查看响应头中的调试信息：
 - `X-Used-Endpoint`: 实际使用的端点
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
-- `X-Route-Type`: 路由类型（`claude` / `codex` / `codex-fallback` / `claude-fallback`）
-- `X-Fallback-Reason`: 备用原因（`forced-by-header` / `all-claude-endpoints-failed` / `all-codex-sources-failed`）
-
-如需验证“强制走 GPT（Codex）”，可使用：
-
-```bash
-curl https://your-worker.workers.dev/v1/messages \
-  -H "x-api-key: your-api-key" \
-  -H "Authorization: Bearer your-api-key" \
-  -H "anthropic-version: 2023-06-01" \
-  -H "x-force-codex: true" \
-  -H "content-type: application/json" \
-  -d '{
-    "model": "claude-sonnet-4-6",
-    "messages": [{"role": "user", "content": "ping"}]
-  }' -i
-```
-
-当响应头是 `X-Route-Type: codex-fallback` 时，说明请求已按预期进入 Codex 强制链路。
+- `X-Route-Type`: 路由类型（`claude` / `codex`）
 
 ## 使用指定端点路由（高级功能）
 
@@ -193,16 +156,16 @@ curl https://your-worker.workers.dev/v1/messages \
 {
   "env": {
     "ANTHROPIC_AUTH_TOKEN": "your-api-key",
-    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev/claude/ultra"
+    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev/codex"
   }
 }
 ```
 
-这样配置后，所有请求都会优先使用 ultra 端点；默认只会在 ultra 端点内重试主备源。
+这样配置后，所有请求都会优先使用 foxcode 官方 Claude 兼容 Codex 端点；默认还会向更便宜的 aws 端点降级。
 
 ### 通过 ANTHROPIC_CUSTOM_HEADERS 控制是否允许更高等级降级
 
-默认情况下，Worker 不会自动降级到更高等级端点（`ultra/super/claude`）。  
+默认情况下，Worker 最多自动升级到 `ultra`，不会继续尝试 `turbo/super/claude`。
 如需开启，请在 Claude Code 中设置：
 
 ```json
@@ -215,17 +178,20 @@ curl https://your-worker.workers.dev/v1/messages \
 }
 ```
 
-该配置会注入 `x-ccr-tier: true`，Worker 才会继续尝试更高等级端点。
+该配置会注入 `x-ccr-tier: true`，Worker 才会继续尝试 `turbo/super/claude`。
 `ANTHROPIC_CUSTOM_HEADERS` 支持多行格式：`"Header1: value1\nHeader2: value2"`。
 
 ### 支持的端点路径
 
-- `https://your-worker.workers.dev/claude/ultra` - 优先使用 ultra 端点（最便宜）
+- `https://your-worker.workers.dev/claude/aws` - 优先使用 aws 端点（最便宜）
+- `https://your-worker.workers.dev/codex` - 优先使用 foxcode 官方 Claude 兼容 Codex 端点
+- `https://your-worker.workers.dev/claude/ultra` - 优先使用 ultra 端点
+- `https://your-worker.workers.dev/claude/turbo` - 优先使用 turbo 端点
 - `https://your-worker.workers.dev/claude/super` - 优先使用 super 端点
 - `https://your-worker.workers.dev/claude` - 优先使用 claude 端点（最贵）
 - `https://your-worker.workers.dev` - 自动路由（默认，推荐）
 
-说明：`/claude/droid`、`/claude/aws` 当前仅做路径兼容，不再作为可用候选端点参与调度。
+原生 Codex 客户端仍使用 `/codex/v1/responses`、`/codex/v1/chat/completions`、`/codex/v1/images/generations`、`/codex/v1/models`。
 
 多数场景下建议直接使用默认自动路由。
 
@@ -235,7 +201,7 @@ curl https://your-worker.workers.dev/v1/messages \
 
 响应头中包含：
 - `X-Used-Endpoint`: 实际使用的端点路径
-- `X-Endpoint-Index`: 端点索引（0=ultra, 1=super, 2=claude）
+- `X-Endpoint-Index`: 端点索引（0=aws, 1=codex, 2=ultra, 3=turbo, 4=super, 5=claude）
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
 - `X-Allow-Higher-Tier-Fallback`: 是否允许向更高等级端点降级（`true/false`）
 
@@ -251,7 +217,7 @@ wrangler tail
 
 ### 调整冷却时间
 
-修改 [worker.js](worker.js) 中的配置：
+修改 [src/config.js](src/config.js) 中的配置：
 
 ```javascript
 const HEALTH_CHECK_CONFIG = {
@@ -272,8 +238,8 @@ A: 完全支持！Worker 会透传 Server-Sent Events (SSE) 流式响应，Claud
 
 ## 路由规则（简版）
 
-1. 默认从低价层级（ultra）开始，且不自动升到更高层级
-2. 设置 `x-ccr-tier: true` 后，才允许尝试 `super/claude`
+1. 默认从低价层级（aws）开始，失败时最多自动升级到 ultra
+2. 设置 `x-ccr-tier: true` 后，才允许继续尝试 `turbo/super/claude`
 3. 指定端点时先尝试该端点，再按规则继续
 4. 每个端点先主源再备源，两个源都失败才换下一个端点
 

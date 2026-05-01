@@ -13,13 +13,13 @@
 
 ## 功能特性
 
-- **价格优先**: 按价格从低到高排序（ultra < super < claude）
+- **价格优先**: 按价格从低到高排序（aws < codex < ultra < turbo < super < claude）
 - **指定端点路由**: 支持通过路径指定优先使用的端点（如 `/claude/ultra/v1/messages`）
 - **OpenAI 兼容接口**: 支持 OpenAI Chat Completions API 格式，自动转换为 Claude API
 - **智能故障转移**: 遇到 4xx/5xx 错误自动切换到下一个端点
 - **双源互备**: 主源 (newcli) 和备源 (dm-fox) 相互备份，单个端点失败时先尝试备源的相同端点
 - **Codex 兼容代理**: 支持 `/codex/v1` 路由主备重试；`/responses` 透传，`/chat/completions` 自动格式转换
-- **跨协议备用**: Claude 全挂时自动切换到 Codex，Codex 全挂时自动切换到 Claude（自动协议转换）
+- **模块化源码**: 源码位于 `src/`，Wrangler 部署时会从 `src/worker.js` 打包到 Cloudflare Worker
 - **内存状态管理**: 使用全局内存缓存记录端点健康状态（同一实例内共享）
 - **自动冷却**: 连续失败 3 次的端点会被标记为不可用 1 分钟
 - **自动恢复**: 冷却期结束后端点自动恢复可用
@@ -47,10 +47,9 @@
 4. 开始使用！Claude 请求会自动选择可用端点，Codex 请求走 `/codex/v1` 主备源重试
 
 **提示**：
-- Claude 默认使用自动路由，从最低价层级（ultra）开始尝试
+- Claude 默认使用自动路由，从最低价层级（aws）开始尝试，不可用时最多自动升级到 ultra
 - Codex 统一使用 `https://your-worker.workers.dev/codex/v1/...` 路径
-- Claude Code 可通过 `x-force-codex: true` 强制走 GPT/Codex
-- 你也可以指定 Claude 特定端点，如 `https://your-worker.workers.dev/claude/ultra`
+- 你也可以指定 Claude 特定端点，如 `https://your-worker.workers.dev/claude/ultra` 或 `https://your-worker.workers.dev/codex`
 - Claude Code 详细配置请查看 [Claude Code 配置指南](CLAUDE_CODE_SETUP.md)
 
 ## 部署步骤
@@ -90,8 +89,8 @@ wrangler deploy
 ## 使用方法
 
 按路由类型使用：
-- Claude：`/v1/messages`、`/v1/chat/completions`、`/claude/*`
-- Codex：`/codex/v1/*`
+- Claude：`/v1/messages`、`/v1/chat/completions`、`/claude/*`、`/codex/v1/messages`
+- Codex 原生客户端：`/codex/v1/responses`、`/codex/v1/chat/completions`、`/codex/v1/images/generations`、`/codex/v1/models`
 
 ### Claude 路由：自动路由（默认）
 
@@ -112,10 +111,10 @@ curl https://your-worker.workers.dev/v1/messages \
 ```
 
 Worker 会自动：
-1. 优先尝试最低价层级端点（`/claude/ultra`）
-2. 默认不会自动升级到更高价层级（`ultra/super/claude`）
-3. 若请求头 `x-ccr-tier: true`，才会继续尝试更高价层级
-4. 所有允许范围内的 Claude 端点都失败时，自动切换到 Codex（协议自动转换）
+1. 优先尝试最低价层级端点（`/claude/aws`）
+2. 默认会在 `aws -> codex -> ultra` 范围内自动升级
+3. 若请求头 `x-ccr-tier: true`，才会继续尝试 `turbo -> super -> claude`
+4. 所有允许范围内的 Claude 端点都失败时，返回 Claude 路由错误
 5. 记录失败状态，连续失败 3 次后暂时跳过该端点
 
 可通过 Claude Code 的 `ANTHROPIC_CUSTOM_HEADERS` 注入开关头：
@@ -137,10 +136,13 @@ Worker 会自动：
 
 | 场景 | `ANTHROPIC_BASE_URL` | `ANTHROPIC_CUSTOM_HEADERS` | 默认尝试顺序 |
 |---|---|---|---|
-| 最省钱（推荐默认） | `https://your-worker.workers.dev` | 不设置 | `ultra` |
-| 固定从 ultra 开始 | `https://your-worker.workers.dev/claude/ultra` | 不设置 | `ultra` |
-| 固定从 super 开始 | `https://your-worker.workers.dev/claude/super` | 不设置 | `super -> ultra` |
-| 固定从 claude 开始 | `https://your-worker.workers.dev/claude` | 不设置 | `claude -> ultra -> super` |
+| 最省钱（推荐默认） | `https://your-worker.workers.dev` | 不设置 | `aws -> codex -> ultra` |
+| 自动路由且允许升档 | `https://your-worker.workers.dev` | `x-ccr-tier: true` | `aws -> codex -> ultra -> turbo -> super -> claude` |
+| 固定从 codex 开始 | `https://your-worker.workers.dev/codex` | 不设置 | `codex -> aws` |
+| 固定从 ultra 开始 | `https://your-worker.workers.dev/claude/ultra` | 不设置 | `ultra -> aws -> codex` |
+| 固定从 turbo 开始 | `https://your-worker.workers.dev/claude/turbo` | 不设置 | `turbo -> aws -> codex -> ultra` |
+| 固定从 super 开始 | `https://your-worker.workers.dev/claude/super` | 不设置 | `super -> aws -> codex -> ultra -> turbo` |
+| 固定从 claude 开始 | `https://your-worker.workers.dev/claude` | 不设置 | `claude -> aws -> codex -> ultra -> turbo -> super` |
 
 如果要允许走更高等级端点，在 `ANTHROPIC_CUSTOM_HEADERS` 加：
 `x-ccr-tier: true`
@@ -150,8 +152,8 @@ Worker 会自动：
 通过在路径中指定端点名称，可以优先使用特定端点：
 
 ```bash
-# 优先使用 ultra 端点
-curl https://your-worker.workers.dev/claude/ultra/v1/messages \
+# 优先使用 aws 端点
+curl https://your-worker.workers.dev/claude/aws/v1/messages \
   -H "x-api-key: your-api-key" \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
@@ -163,14 +165,17 @@ curl https://your-worker.workers.dev/claude/ultra/v1/messages \
     ]
   }'
 
-# 优先使用 super 端点
-curl https://your-worker.workers.dev/claude/super/v1/messages \
+# 优先使用 foxcode 官方 Claude 兼容 Codex 端点
+curl https://your-worker.workers.dev/codex/v1/messages \
   -H "x-api-key: your-api-key" \
   ...
 ```
 
 **支持的端点路径**：
-- `/claude/ultra/v1/messages` - 优先使用 ultra 端点（最便宜）
+- `/claude/aws/v1/messages` - 优先使用 aws 端点（最便宜）
+- `/codex/v1/messages` - 优先使用 foxcode 官方 Claude 兼容 Codex 端点
+- `/claude/ultra/v1/messages` - 优先使用 ultra 端点
+- `/claude/turbo/v1/messages` - 优先使用 turbo 端点
 - `/claude/super/v1/messages` - 优先使用 super 端点
 - `/claude/v1/messages` - 优先使用 claude 端点（最高等级）
 - `/v1/messages` - 自动路由（默认行为）
@@ -252,14 +257,14 @@ curl https://your-worker.workers.dev/v1/models \
 
 ### Codex 路由：透传代理 + Chat Completions 兼容
 
-Codex 默认上游路由是 `https://code.newcli.com/codex/v1`。通过本 Worker 时，请使用相同路径前缀：
+Codex 原生客户端路由是 `/codex/v1/...`。注意：`/codex` 同时也是一个 Claude 兼容端点，Claude 客户端会调用 `/codex/v1/messages`；原生 Codex 客户端继续使用 `/codex/v1/responses`、`/codex/v1/chat/completions`、`/codex/v1/images/generations`、`/codex/v1/models`。
 
 ```bash
 curl https://your-worker.workers.dev/codex/v1/responses \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5-codex",
+    "model": "gpt-5.3-codex",
     "input": "Write a haiku about retries."
   }'
 ```
@@ -278,60 +283,40 @@ curl https://your-worker.workers.dev/codex/v1/chat/completions \
   }'
 ```
 
-**行为说明**：
-- `/codex/v1/models`：返回 OpenAI Models 列表格式的 Codex 模型清单（用于 SDK 探活/模型枚举，含 `gpt-5.4`）
-- `/codex/v1/models/{model}`：返回单模型元数据（含 `context_length`/`max_output_tokens` 等字段，默认按 GPT-5 系列 `400k/128k`）
-- `/codex/v1/responses`：请求和响应都会原样透传，不做 Claude/OpenAI 格式转换
-- `/codex/v1/chat/completions`：自动转换为 Codex Responses 请求并将响应转换回 OpenAI Chat Completions（支持 SSE 与 tools/tool_calls）
-- 先尝试主源 `https://code.newcli.com`，失败（4xx/5xx 或网络错误）后自动尝试备源 `https://dm-fox.rjj.cc`
-- 当两个源都失败时，自动切换到 Claude 端点作为备用（协议自动转换）
-- 如果仍然失败，优先返回最后一个上游错误响应体，保持 Codex 错误格式兼容
-
-### Claude Code 强制走 GPT（Codex）
-
-如果你希望 Claude Code 请求不走 Claude 端点，而是直接走 Codex/GPT，可在 `~/.claude/settings.json` 注入自定义头：
-
-```json
-{
-  "env": {
-    "ANTHROPIC_AUTH_TOKEN": "your-api-key",
-    "ANTHROPIC_BASE_URL": "https://your-worker.workers.dev",
-    "ANTHROPIC_CUSTOM_HEADERS": "x-force-codex: true"
-  }
-}
-```
-
-验证示例：
+文生图使用 `gpt-image-2`：
 
 ```bash
-curl https://your-worker.workers.dev/v1/messages \
-  -H "x-api-key: your-api-key" \
+curl https://your-worker.workers.dev/codex/v1/images/generations \
   -H "Authorization: Bearer your-api-key" \
-  -H "anthropic-version: 2023-06-01" \
-  -H "x-force-codex: true" \
-  -H "content-type: application/json" \
+  -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4-6",
-    "messages": [{"role": "user", "content": "ping"}]
-  }' -i
+    "model": "gpt-image-2",
+    "prompt": "一个小男孩",
+    "size": "1536x1024",
+    "quality": "high",
+    "n": 1
+  }'
 ```
 
-返回头中出现 `X-Route-Type: codex-fallback` 即表示已走 GPT/Codex。
-
-说明：在 `x-force-codex: true` 模式下，`/v1/messages` 的 `tools/tool_choice` 会透传到 Codex，并将工具调用结果回转为 Claude `tool_use` 格式；`stream: true` 时返回 Claude SSE 事件流（不降级为 JSON）。
-另外，当 `x-force-codex: true` 且所有 Codex 源都失败时，会直接返回 Codex 错误响应（`X-Fallback-Reason: forced-by-header`），不会再回退到 Claude 路由。
+**行为说明**：
+- `/codex/v1/models`：返回 OpenAI Models 列表格式的 Codex 模型清单（用于 SDK 探活/模型枚举，含 `gpt-5.2`、`gpt-5.3-codex`、`gpt-5.4`、`gpt-5.5` 与 `gpt-image-2`）
+- `/codex/v1/models/{model}`：返回单模型元数据（含 `context_length`/`max_output_tokens` 等字段，默认按 GPT-5 系列 `400k/128k`）
+- `/codex/v1/responses`：请求和响应都会原样透传，不做 Claude/OpenAI 格式转换
+- `/codex/v1/chat/completions`：自动转换为 Codex Responses 请求并将响应转换回 OpenAI Chat Completions（支持 SSE；tools 参数会透传，上游返回的工具调用会映射为 `tool_calls`）
+- `/codex/v1/images/generations`：原样透传到上游，支持 `gpt-image-2`
+- 先尝试主源 `https://code.newcli.com`，失败（4xx/5xx 或网络错误）后自动尝试备源 `https://dm-fox.rjj.cc`
+- 当两个源都失败时，优先返回最后一个上游错误响应体，保持 Codex 错误格式兼容；不会再切换到 Claude 路由
 
 ## 调试
 
 响应头中包含调试信息：
-- `X-Route-Type`: 路由类型（`claude`、`codex`、`codex-fallback`、`claude-fallback`）
+- `X-Route-Type`: 路由类型（`claude`、`codex`）
 - `X-Used-Endpoint`: 实际使用的端点路径
-- `X-Endpoint-Index`: 端点索引（0=ultra, 1=super, 2=claude）
+- `X-Endpoint-Index`: Claude 兼容端点索引（0=aws, 1=codex, 2=ultra, 3=turbo, 4=super, 5=claude）
 - `X-Used-Base-URL`: 实际使用的基础 URL（主源或备源）
 - `X-Base-URL-Index`: 基础 URL 索引（0=主源 newcli, 1=备源 dm-fox）
 - `X-Preferred-Endpoint`: 请求指定的优先端点（如果有）
 - `X-Format-Conversion`: 格式转换标记（例如 `OpenAI` 或 `openai-chat<->codex-responses`）
-- `X-Fallback-Reason`: 跨协议备用原因（`forced-by-header`、`all-claude-endpoints-failed` 或 `all-codex-sources-failed`）
 - `X-Allow-Higher-Tier-Fallback`: 是否允许向更高等级端点降级（`true/false`）
 
 说明：`X-Used-Endpoint`、`X-Endpoint-Index`、`X-Preferred-Endpoint`、`X-Format-Conversion` 主要用于 Claude/OpenAI 路由；Codex 路由重点查看 `X-Route-Type`、`X-Used-Base-URL`、`X-Base-URL-Index`。
@@ -351,8 +336,14 @@ bash scripts/verify_local_wrangler_dev.sh
 
 该脚本会自动：
 - 启动本地 `wrangler dev`（默认 `http://127.0.0.1:8787`）
-- 运行完整验证（`/codex/v1/models`、`/codex/v1/chat/completions`、tools、`x-force-codex`）
+- 运行完整验证（`/codex/v1/models`、`gpt-image-2` 模型详情、`/codex/v1/chat/completions`、tools）
 - 测试结束后自动关闭本地进程
+
+默认不会发起真实图片生成请求。需要验证文生图时可设置：
+
+```bash
+CCR_VERIFY_IMAGES=true bash scripts/verify_local_wrangler_dev.sh
+```
 
 可选环境变量：
 - `CCR_LOCAL_PORT`：本地端口（默认 `8787`）
@@ -360,7 +351,7 @@ bash scripts/verify_local_wrangler_dev.sh
 
 ## 配置调整
 
-修改 [worker.js:24-32](worker.js#L24-L32) 中的配置：
+修改 [src/config.js](src/config.js) 中的配置：
 
 ```javascript
 const HEALTH_CHECK_CONFIG = {
@@ -379,11 +370,11 @@ const HEALTH_CHECK_CONFIG = {
 
 ## 路由摘要
 
-- Claude/OpenAI 路由：`/v1/messages`、`/v1/chat/completions`、`/claude/*`
-- Codex 路由：`/codex/v1/*`
-- Claude 默认只尝试当前价格层级及以下，设置 `x-ccr-tier: true` 才允许更高层级
+- Claude/OpenAI 路由：`/v1/messages`、`/v1/chat/completions`、`/claude/*`、`/codex/v1/messages`
+- Codex 原生客户端路由：`/codex/v1/responses`、`/codex/v1/chat/completions`、`/codex/v1/images/generations`、`/codex/v1/models`
+- Claude 默认从 aws 开始，失败时最多自动升级到 ultra；设置 `x-ccr-tier: true` 才允许继续尝试 turbo/super/claude
 - 每个端点先试主源 `code.newcli.com`，再试备源 `dm-fox.rjj.cc`
-- Claude 全挂自动切 Codex；Codex 全挂自动切 Claude（协议自动转换）
+- Claude 和 Codex 路由彼此独立；任一路由全部源失败时返回该路由自身的错误
 
 ## License
 
