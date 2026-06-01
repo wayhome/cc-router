@@ -22,6 +22,7 @@ import {
   applyCorsHeaders,
   jsonError,
   jsonResponse,
+  sanitizeProxyResponseHeaders,
   shouldAllowHigherTierFallback
 } from './utils.js';
 import {
@@ -142,7 +143,7 @@ async function handleCodexRoute(request, apiPath) {
 
   if (!codexResult.success) {
     if (codexResult.response) {
-      const failHeaders = new Headers(codexResult.response.headers);
+      const failHeaders = sanitizeProxyResponseHeaders(codexResult.response.headers);
       applyCorsHeaders(failHeaders);
       failHeaders.set('X-Route-Type', ROUTE_TYPES.CODEX);
       if (codexResult.baseUrlIndex >= 0) {
@@ -183,7 +184,7 @@ async function handleCodexRoute(request, apiPath) {
     }
   }
 
-  const codexHeaders = new Headers(finalResponse.headers);
+  const codexHeaders = sanitizeProxyResponseHeaders(finalResponse.headers);
   applyCorsHeaders(codexHeaders);
   codexHeaders.set('X-Route-Type', ROUTE_TYPES.CODEX);
   codexHeaders.set('X-Used-Base-URL', TARGET_BASE_URLS[codexResult.baseUrlIndex]);
@@ -259,7 +260,7 @@ async function handleClaudeRoute(request, route) {
   let responseBody = result.response.body;
   const responseStatus = result.response.status;
   const contentType = result.response.headers.get('content-type');
-  const responseHeaders = new Headers(result.response.headers);
+  const responseHeaders = sanitizeProxyResponseHeaders(result.response.headers);
 
   if (isOpenAI && responseStatus === 200) {
     if (contentType?.includes('text/event-stream')) {

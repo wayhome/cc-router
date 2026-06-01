@@ -41,6 +41,20 @@ export function applyCorsHeaders(headers) {
   headers.set('Access-Control-Allow-Headers', '*');
 }
 
+const UNSAFE_PROXY_RESPONSE_HEADERS = [
+  'content-encoding',
+  'content-length',
+  'transfer-encoding'
+];
+
+export function sanitizeProxyResponseHeaders(headers) {
+  const sanitized = new Headers(headers);
+  for (const header of UNSAFE_PROXY_RESPONSE_HEADERS) {
+    sanitized.delete(header);
+  }
+  return sanitized;
+}
+
 export function jsonResponse(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
     status,

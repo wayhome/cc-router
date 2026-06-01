@@ -1,5 +1,31 @@
 # TODO
 
+## 2026-06-01 修复 Codex 流式响应偶发解码失败
+
+- [x] 定位 Codex 接入下 `Stream disconnected before completion: Transport error: network error: error decoding response body` 的 Worker 侧根因
+- [x] 为响应头清理行为补失败测试，覆盖 `Content-Encoding`、`Content-Length`、`Transfer-Encoding` 等不应下发的 body/framing 头
+- [x] 实现最小修复，确保透传或转换后的响应不会携带过期 body/framing 头
+- [x] 执行 JavaScript 语法检查、本地单元测试和可用的项目验证
+- [x] 记录 Review 结果
+
+### 验收标准
+
+- [x] Codex 响应透传和 OpenAI Chat 兼容转换返回前都会移除易导致客户端解码失败的响应头
+- [x] Claude/OpenAI 兼容转换路径也复用同一清理逻辑，避免同类问题
+- [x] 新测试能在修复前失败、修复后通过
+
+### Review
+
+- 根因判断：Worker 会把上游响应 body 重新封装或转换后返回，但之前仍复制上游 `Content-Encoding`、`Content-Length`、`Transfer-Encoding`。当 Worker/fetch 已经解码、转换或重新分块 body 时，这些过期头会让 Codex 客户端按错误编码或长度读取，触发 `error decoding response body`。
+- `src/utils.js` 新增 `sanitizeProxyResponseHeaders()`，集中删除易导致下游 body 解码失败的响应头。
+- `src/worker.js` 已在 Codex 上游错误透传、Codex 成功透传/转换、Claude 成功透传/转换三处复用清理逻辑。
+- 已新增 `tests/response_headers.test.js`；修复前因缺少 `sanitizeProxyResponseHeaders` 失败，修复后通过。
+- 验证通过：`node --test`、所有 `src/*.js` 与 `src/conversions/*.js` 的 `node --check`、`git diff --check`、`wrangler deploy --dry-run`。
+- `npm test` 未通过：仓库没有 `package.json`，npm 返回 `ENOENT`。
+- `bash scripts/verify_local_wrangler_dev.sh` 通过：本地 Worker 下 models、model detail、image model detail、chat.completions 非流、chat.completions 流式和 tools 验证均通过。
+- `wrangler deploy --dry-run` 打包成功，仍有 Wrangler 写 `/Users/wayhome/Library/Preferences/.wrangler/logs/...` 的 `EPERM` 日志警告，不影响 dry-run 打包结果。
+
+
 ## 2026-05-02 刷新 README 当前行为说明
 
 - [x] 对照 `src/config.js`、`src/paths.js`、`src/utils.js` 校验 README 路由说明
