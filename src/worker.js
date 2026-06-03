@@ -32,7 +32,8 @@ import {
 } from './conversions/openai-claude.js';
 import {
   convertCodexResponseToOpenAIResponse,
-  convertOpenAIToCodexRequest
+  convertOpenAIToCodexRequest,
+  monitorCodexStreamFailure
 } from './conversions/openai-codex.js';
 
 function optionsResponse() {
@@ -168,12 +169,17 @@ async function handleCodexRoute(request, apiPath) {
   }
 
   let finalResponse = codexResult.response;
+  const recordCodexStreamFailure = async () => {
+    await manager.recordHardFailure(0, codexResult.baseUrlIndex, ROUTE_TYPES.CODEX);
+  };
+
   if (isCodexOpenAIChat) {
     try {
       finalResponse = await convertCodexResponseToOpenAIResponse(
         codexResult.response,
         codexOriginalModel,
-        codexStreamRequest
+        codexStreamRequest,
+        { onStreamFailure: recordCodexStreamFailure }
       );
     } catch (error) {
       console.error('Failed to convert codex response to OpenAI format:', error.message, error.stack);
@@ -193,7 +199,12 @@ async function handleCodexRoute(request, apiPath) {
     codexHeaders.set('X-Format-Conversion', 'openai-chat<->codex-responses');
   }
 
-  return new Response(finalResponse.body, {
+  const codexContentType = finalResponse.headers.get('content-type') || '';
+  const codexBody = !isCodexOpenAIChat && codexContentType.toLowerCase().includes('text/event-stream')
+    ? monitorCodexStreamFailure(finalResponse.body, recordCodexStreamFailure)
+    : finalResponse.body;
+
+  return new Response(codexBody, {
     status: finalResponse.status,
     statusText: finalResponse.statusText,
     headers: codexHeaders

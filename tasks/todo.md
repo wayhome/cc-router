@@ -1,5 +1,30 @@
 # TODO
 
+## 2026-06-03 修复 Codex 流式上游失败断开
+
+- [x] 定位 `Stream disconnected before completion: Upstream request failed` 的流式路径根因
+- [x] 为最小复现场景补失败测试
+- [x] 实现最小修复，让后续 Codex 重连避开流内失败的源
+- [x] 执行 JavaScript 测试、语法检查、diff 检查和 `npm test`
+- [x] 记录 Review 结果
+
+### 验收标准
+
+- [x] 原生 Codex SSE 透传遇到 `response.failed` 或 `error` 后，会把当前源立即放入冷却
+- [x] Codex/OpenAI Chat 流式转换遇到上游 SSE failure 时，也会更新当前源健康状态
+- [x] 后续 Codex reconnect 会优先尝试备用源
+- [x] 现有 429 failover 与响应头清理测试仍通过
+
+### Review
+
+- 根因判断：原生 Codex `/codex/v1/responses` 只按 HTTP status 做成功/失败判断。上游 SSE 以 200 建连后再发送 `response.failed` / `error` 时，路由器会把该源记为成功并继续透传，Codex 客户端最终看到 `Stream disconnected before completion: Upstream request failed`，且后续重连仍可能打到同一个源。
+- `src/conversions/openai-codex.js` 新增原生 Codex SSE 透传监控：body 原样转发，同时解析 SSE 事件；遇到 `response.failed` 或 `error` 时调用回调。
+- `src/worker.js` 把原生 Codex SSE 监控和 Codex -> OpenAI Chat 流式转换都接到健康管理器；遇到上游流失败时把当前 Codex 源立即冷却。OpenAI Chat 转换遇到失败时仍按原协议输出 error + `[DONE]`。
+- `src/health.js` 新增 `recordHardFailure()`，用于流内终止这类已经证明当前源不可用的场景，避免等满 3 次普通失败。
+- 新增 `tests/rate_limit_failover.test.js` 用例。修复前第二次请求仍访问 `code.newcli.com`；修复后第一次流内失败消费完后，第二次请求访问 `dm-fox.rjj.cc`。
+- 验证通过：`node --test`、`find src tests -name '*.js' -print0 | xargs -0 -n1 node --check`、`git diff --check`。
+- `npm test` 未通过：当前未跟踪的 `package.json` 是空对象，没有 `test` script；npm 还因无法写 `/Users/wayhome/.npm/_logs` 未落日志。
+
 ## 2026-06-03 Codex 429 每源重试两次
 
 - [x] 明确 Codex 429 重试语义：每个 base URL 首次请求后最多再重试 2 次

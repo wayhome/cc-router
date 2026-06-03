@@ -439,7 +439,108 @@ export async function parseCodexSSEToResponse(stream) {
   return codexResponse;
 }
 
-export async function convertCodexStreamToOpenAI(codexStream, originalModel) {
+export function monitorCodexStreamFailure(stream, onStreamFailure) {
+  if (!stream) return stream;
+
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let failureRecorded = false;
+
+  const recordFailure = async () => {
+    if (failureRecorded) return;
+    failureRecorded = true;
+    await onStreamFailure();
+  };
+
+  const handlePayload = async (eventType, rawPayload) => {
+    if (!rawPayload || rawPayload === '[DONE]') return;
+
+    try {
+      const payload = JSON.parse(rawPayload);
+      const type = payload.type || eventType;
+      if (type === 'response.failed' || type === 'error') {
+        await recordFailure();
+      }
+    } catch (error) {
+      // Malformed pass-through events should not break the client stream.
+    }
+  };
+
+  const processBuffer = async (flush = false) => {
+    const lines = buffer.split('\n');
+    if (!flush) {
+      buffer = lines.pop() || '';
+    } else {
+      buffer = '';
+    }
+
+    let eventType = '';
+    let dataLines = [];
+
+    const commitEvent = async () => {
+      if (dataLines.length === 0) return;
+      await handlePayload(eventType, dataLines.join('\n'));
+      eventType = '';
+      dataLines = [];
+    };
+
+    for (const rawLine of lines) {
+      const line = rawLine.endsWith('\r')
+        ? rawLine.slice(0, -1)
+        : rawLine;
+
+      if (line === '') {
+        await commitEvent();
+        continue;
+      }
+
+      if (line.startsWith(':')) continue;
+
+      if (line.startsWith('event:')) {
+        eventType = line.slice(6).trim();
+        continue;
+      }
+
+      if (line.startsWith('data:')) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+
+    if (flush) {
+      await commitEvent();
+    }
+  };
+
+  return new ReadableStream({
+    async start(controller) {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            buffer += decoder.decode();
+            await processBuffer(true);
+            controller.close();
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          controller.enqueue(value);
+          await processBuffer(false);
+        }
+      } catch (error) {
+        await recordFailure();
+        controller.error(error);
+      }
+    },
+
+    async cancel(reason) {
+      await reader.cancel(reason);
+    }
+  });
+}
+
+export async function convertCodexStreamToOpenAI(codexStream, originalModel, options = {}) {
   if (!codexStream) {
     throw new Error('Codex stream body is empty');
   }
@@ -483,6 +584,12 @@ export async function convertCodexStreamToOpenAI(codexStream, originalModel) {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
       };
 
+      const recordStreamFailure = async () => {
+        if (typeof options.onStreamFailure === 'function') {
+          await options.onStreamFailure();
+        }
+      };
+
       const ensureRoleChunk = () => {
         if (emittedRole) return;
         emitChunk({ role: 'assistant' }, null);
@@ -504,7 +611,7 @@ export async function convertCodexStreamToOpenAI(codexStream, originalModel) {
         return meta;
       };
 
-      const handlePayload = (eventType, rawPayload) => {
+      const handlePayload = async (eventType, rawPayload) => {
         if (!rawPayload || rawPayload === '[DONE]') {
           emitDone();
           return;
@@ -631,6 +738,7 @@ export async function convertCodexStreamToOpenAI(codexStream, originalModel) {
 
           if (type === 'response.failed' || type === 'error') {
             const message = payload.error?.message || 'Codex stream failed';
+            await recordStreamFailure();
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({
               error: {
                 message,
@@ -644,7 +752,7 @@ export async function convertCodexStreamToOpenAI(codexStream, originalModel) {
         }
       };
 
-      const processBuffer = (flush = false) => {
+      const processBuffer = async (flush = false) => {
         const lines = buffer.split('\n');
         if (!flush) {
           buffer = lines.pop() || '';
@@ -655,9 +763,9 @@ export async function convertCodexStreamToOpenAI(codexStream, originalModel) {
         let eventType = '';
         let dataLines = [];
 
-        const commitEvent = () => {
+        const commitEvent = async () => {
           if (dataLines.length === 0) return;
-          handlePayload(eventType, dataLines.join('\n'));
+          await handlePayload(eventType, dataLines.join('\n'));
           eventType = '';
           dataLines = [];
         };
@@ -668,7 +776,7 @@ export async function convertCodexStreamToOpenAI(codexStream, originalModel) {
             : rawLine;
 
           if (line === '') {
-            commitEvent();
+            await commitEvent();
             continue;
           }
 
@@ -685,7 +793,7 @@ export async function convertCodexStreamToOpenAI(codexStream, originalModel) {
         }
 
         if (flush) {
-          commitEvent();
+          await commitEvent();
         }
       };
 
@@ -693,17 +801,19 @@ export async function convertCodexStreamToOpenAI(codexStream, originalModel) {
         while (true) {
           const { done, value } = await reader.read();
           if (done) {
-            processBuffer(true);
+            buffer += decoder.decode();
+            await processBuffer(true);
             emitDone();
             controller.close();
             break;
           }
 
           buffer += decoder.decode(value, { stream: true });
-          processBuffer(false);
+          await processBuffer(false);
         }
       } catch (error) {
         console.error('Codex->OpenAI stream conversion error:', error);
+        await recordStreamFailure();
         if (!emittedDone) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({
             error: {
@@ -719,12 +829,12 @@ export async function convertCodexStreamToOpenAI(codexStream, originalModel) {
   });
 }
 
-export async function convertCodexResponseToOpenAIResponse(response, originalModel, isStreamRequest) {
+export async function convertCodexResponseToOpenAIResponse(response, originalModel, isStreamRequest, options = {}) {
   const contentType = (response.headers.get('content-type') || '').toLowerCase();
 
   if (isStreamRequest) {
     if (contentType.includes('text/event-stream')) {
-      const openaiStream = await convertCodexStreamToOpenAI(response.body, originalModel);
+      const openaiStream = await convertCodexStreamToOpenAI(response.body, originalModel, options);
       return new Response(openaiStream, {
         status: response.status,
         statusText: response.statusText,

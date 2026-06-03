@@ -49,6 +49,14 @@ export class EndpointHealthManager {
     await this.saveHealth(endpointIndex, baseUrlIndex, health, routeType);
   }
 
+  async recordHardFailure(endpointIndex, baseUrlIndex, routeType = ROUTE_TYPES.CLAUDE) {
+    await this.saveHealth(endpointIndex, baseUrlIndex, {
+      failures: HEALTH_CHECK_CONFIG.MAX_FAILURES,
+      lastFailTime: Date.now(),
+      inCooldown: true
+    }, routeType);
+  }
+
   async recordSuccess(endpointIndex, baseUrlIndex, routeType = ROUTE_TYPES.CLAUDE) {
     const health = await this.getHealth(endpointIndex, baseUrlIndex, routeType);
 

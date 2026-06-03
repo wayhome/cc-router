@@ -109,3 +109,55 @@ test('Codex route stays on the same source when a 429 retry succeeds', async () 
     globalThis.fetch = originalFetch;
   }
 });
+
+test('Codex route avoids a source after its SSE stream fails', async () => {
+  const originalFetch = globalThis.fetch;
+  const upstreamRequests = [];
+
+  globalThis.fetch = async request => {
+    const url = new URL(request.url);
+    upstreamRequests.push(`${url.host}${url.pathname}`);
+
+    if (upstreamRequests.length === 1) {
+      return new Response([
+        'event: response.created',
+        'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.3-codex"}}',
+        '',
+        'event: response.failed',
+        'data: {"type":"response.failed","error":{"message":"Upstream request failed","type":"api_error"}}',
+        '',
+        ''
+      ].join('\n'), {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream; charset=utf-8' }
+      });
+    }
+
+    return new Response([
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_2","model":"gpt-5.3-codex","output_text":"ok"}}',
+      '',
+      ''
+    ].join('\n'), {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream; charset=utf-8' }
+    });
+  };
+
+  try {
+    const firstResponse = await worker.fetch(new Request('https://router.test/codex/v1/responses'));
+    assert.equal(firstResponse.status, 200);
+    assert.match(await firstResponse.text(), /response\.failed/);
+
+    const secondResponse = await worker.fetch(new Request('https://router.test/codex/v1/responses'));
+    assert.equal(secondResponse.status, 200);
+    assert.match(await secondResponse.text(), /response\.completed/);
+
+    assert.deepEqual(upstreamRequests, [
+      'code.newcli.com/codex/v1/responses',
+      'dm-fox.rjj.cc/codex/v1/responses'
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
