@@ -6,6 +6,8 @@ import {
 } from './config.js';
 import { buildEndpointAttemptOrder } from './utils.js';
 
+const CODEX_RATE_LIMIT_ATTEMPTS_PER_SOURCE = 3;
+
 function withBrowserUserAgent(headers) {
   if (!headers.has('user-agent') || headers.get('user-agent').includes('curl')) {
     headers.set('user-agent', BROWSER_USER_AGENT);
@@ -44,6 +46,9 @@ export async function tryEndpoints(request, manager, apiPath, preferredEndpoint 
   const requestHeaders = new Headers(request.headers);
   const triedEndpoints = new Set();
   const candidateEndpointIndices = buildEndpointAttemptOrder(preferredEndpoint, allowHigherTierFallback);
+  let lastResponse = null;
+  let lastEndpointIndex = -1;
+  let lastBaseUrlIndex = -1;
 
   if (candidateEndpointIndices.length === 0) {
     return { response: null, endpointIndex: -1, baseUrlIndex: -1, success: false };
@@ -102,6 +107,9 @@ export async function tryEndpoints(request, manager, apiPath, preferredEndpoint 
           };
         }
 
+        lastResponse = response;
+        lastEndpointIndex = currentIndex;
+        lastBaseUrlIndex = baseUrlIndex;
         await manager.recordFailure(currentIndex, baseUrlIndex, ROUTE_TYPES.CLAUDE);
       } catch (error) {
         await manager.recordFailure(currentIndex, baseUrlIndex, ROUTE_TYPES.CLAUDE);
@@ -109,7 +117,12 @@ export async function tryEndpoints(request, manager, apiPath, preferredEndpoint 
     }
   }
 
-  return { response: null, endpointIndex: -1, baseUrlIndex: -1, success: false };
+  return {
+    response: lastResponse,
+    endpointIndex: lastEndpointIndex,
+    baseUrlIndex: lastBaseUrlIndex,
+    success: false
+  };
 }
 
 export async function tryCodexSources(request, manager, codexPath) {
@@ -147,24 +160,29 @@ export async function tryCodexSources(request, manager, codexPath) {
     lastBaseUrlIndex = currentBaseUrlIndex;
 
     try {
-      const clonedRequest = new Request(request.url, {
-        method: request.method,
-        headers: requestHeaders,
-        body: requestBody.byteLength > 0 ? requestBody : null
-      });
+      for (let sourceAttempt = 0; sourceAttempt < CODEX_RATE_LIMIT_ATTEMPTS_PER_SOURCE; sourceAttempt++) {
+        const clonedRequest = new Request(request.url, {
+          method: request.method,
+          headers: requestHeaders,
+          body: requestBody.byteLength > 0 ? requestBody : null
+        });
 
-      const response = await proxyDirectRequest(clonedRequest, currentBaseUrlIndex, codexPath);
-      if (response.status < 400) {
-        await manager.recordSuccess(0, currentBaseUrlIndex, ROUTE_TYPES.CODEX);
-        return {
-          response,
-          baseUrlIndex: currentBaseUrlIndex,
-          success: true
-        };
+        const response = await proxyDirectRequest(clonedRequest, currentBaseUrlIndex, codexPath);
+        if (response.status < 400) {
+          await manager.recordSuccess(0, currentBaseUrlIndex, ROUTE_TYPES.CODEX);
+          return {
+            response,
+            baseUrlIndex: currentBaseUrlIndex,
+            success: true
+          };
+        }
+
+        lastResponse = response;
+        if (response.status !== 429 || sourceAttempt === CODEX_RATE_LIMIT_ATTEMPTS_PER_SOURCE - 1) {
+          await manager.recordFailure(0, currentBaseUrlIndex, ROUTE_TYPES.CODEX);
+          break;
+        }
       }
-
-      lastResponse = response;
-      await manager.recordFailure(0, currentBaseUrlIndex, ROUTE_TYPES.CODEX);
     } catch (error) {
       await manager.recordFailure(0, currentBaseUrlIndex, ROUTE_TYPES.CODEX);
     }

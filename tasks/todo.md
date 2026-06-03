@@ -1,5 +1,50 @@
 # TODO
 
+## 2026-06-03 Codex 429 每源重试两次
+
+- [x] 明确 Codex 429 重试语义：每个 base URL 首次请求后最多再重试 2 次
+- [x] 为 Codex 路由补失败测试：第一个源 3 次 429 后才切到第二个源
+- [x] 实现最小修复，只对 Codex 429 做每源重试，不扩大到其他 4xx
+- [x] 执行 JavaScript 测试、语法检查、diff 检查和 `npm test`
+- [x] 记录 Review 结果
+
+### 验收标准
+
+- [x] 原生 Codex 源返回 429 时，同一源会先完成 3 次尝试
+- [x] 当前源 3 次 429 后才切换到下一个源
+- [x] 两个源都 429 时，最终仍透传最后一个 429
+
+### Review
+
+- 语义定为：原生 Codex 路由遇到上游 429 时，每个 base URL 最多尝试 3 次（首次请求 + 2 次重试）；3 次仍失败才切到下一个 base URL。
+- `src/proxy.js` 新增 `CODEX_RATE_LIMIT_ATTEMPTS_PER_SOURCE = 3`，并只在 `tryCodexSources()` 的 429 分支内做同源重试。非 429 的 4xx/5xx 和 fetch 异常仍沿用原来的失败切源行为。
+- `tests/rate_limit_failover.test.js` 已覆盖两个 Codex 场景：两个源都 429 时请求顺序为主源 3 次、备源 3 次，最终透传 429；主源前两次 429、第三次成功时不切换备源。
+- 验证通过：`node --test`、`node --check src/proxy.js`、`node --check src/worker.js`、`node --check tests/rate_limit_failover.test.js`、`git diff --check`。
+- `npm test` 未通过：当前未跟踪的 `package.json` 内容为空对象，没有 `test` script。
+
+## 2026-06-03 恢复 429 上游错误语义
+
+- [x] 确认当前 Claude/Codex 代理路径对 429 的处理和历史行为差异
+- [x] 为 Claude 路由补失败测试：所有候选返回 429 时应透传最后一个 429，而不是返回 503
+- [x] 实现最小修复，保留现有切源/切端点重试行为并在失败时带回最后上游响应
+- [x] 执行 JavaScript 测试、语法检查和 diff 检查
+- [x] 记录 Review 结果
+
+### 验收标准
+
+- [x] 429 仍会参与现有 failover 尝试
+- [x] Claude 路由所有候选都 429 时，客户端收到 429 和上游响应头
+- [x] 无上游响应时仍返回 503
+
+### Review
+
+- 根因判断：当前并没有显式等待后重打同一个 429 源；现有行为是把 `>=400` 作为失败并继续切源/切端点。Codex 路由会保留最后一个失败响应，但 Claude 路由以前丢掉失败响应，所有候选失败后统一返回 503，导致客户端看不到真实 429/`Retry-After`。
+- `src/proxy.js` 已让 `tryEndpoints()` 在失败时保留最后一个上游失败响应及其 endpoint/base URL 索引；没有上游响应时仍返回 `response: null`。
+- `src/worker.js` 已在 Claude 路由失败分支透传真实上游失败响应，复用 `sanitizeProxyResponseHeaders()` 和 CORS/调试响应头；只有没有上游响应时继续返回 503。
+- 新增 `tests/rate_limit_failover.test.js`。Claude 用例修复前失败为 `503 !== 429`，修复后通过，并断言默认 Claude failover 尝试 6 个候选源；Codex 用例确认原生 Codex 路由两个 base URL 都 429 时会透传最后一个 429。
+- 验证通过：`node --test`、所有 `src/**/*.js` 与 `tests/*.js` 的 `node --check`、`git diff --check`。
+- `npm test` 未通过：当前未跟踪的 `package.json` 内容为空对象，没有 `test` script。
+
 ## 2026-06-01 修复 Codex 流式响应偶发解码失败
 
 - [x] 定位 Codex 接入下 `Stream disconnected before completion: Transport error: network error: error decoding response body` 的 Worker 侧根因

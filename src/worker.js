@@ -238,6 +238,33 @@ async function handleClaudeRoute(request, route) {
   );
 
   if (!result.success) {
+    if (result.response) {
+      const failHeaders = sanitizeProxyResponseHeaders(result.response.headers);
+      applyCorsHeaders(failHeaders);
+      failHeaders.set('X-Route-Type', ROUTE_TYPES.CLAUDE);
+      if (result.endpointIndex >= 0) {
+        failHeaders.set('X-Used-Endpoint', ENDPOINTS[result.endpointIndex]);
+        failHeaders.set('X-Endpoint-Index', result.endpointIndex.toString());
+      }
+      if (result.baseUrlIndex >= 0) {
+        failHeaders.set('X-Used-Base-URL', TARGET_BASE_URLS[result.baseUrlIndex]);
+        failHeaders.set('X-Base-URL-Index', result.baseUrlIndex.toString());
+      }
+      failHeaders.set('X-Allow-Higher-Tier-Fallback', allowHigherTierFallback ? 'true' : 'false');
+      if (preferredEndpoint) {
+        failHeaders.set('X-Preferred-Endpoint', preferredEndpoint);
+      }
+      if (isOpenAI) {
+        failHeaders.set('X-Format-Conversion', 'OpenAI');
+      }
+
+      return new Response(result.response.body, {
+        status: result.response.status,
+        statusText: result.response.statusText,
+        headers: failHeaders
+      });
+    }
+
     const errorBody = isOpenAI
       ? JSON.stringify({
           error: {
