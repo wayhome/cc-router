@@ -426,7 +426,11 @@ export async function parseCodexSSEToResponse(stream) {
   buffer += decoder.decode();
   processBuffer(true);
 
-  const codexResponse = completedResponse ? { ...completedResponse } : {};
+  if (!completedResponse) {
+    throw new Error('Codex stream closed before response.completed');
+  }
+
+  const codexResponse = { ...completedResponse };
   if (!codexResponse.id) codexResponse.id = `resp-${Date.now()}`;
   if (!codexResponse.model) codexResponse.model = 'gpt-5.3-codex';
   if ((!Array.isArray(codexResponse.output) || codexResponse.output.length === 0) && outputItems.length > 0) {
@@ -446,6 +450,7 @@ export function monitorCodexStreamFailure(stream, onStreamFailure) {
   const decoder = new TextDecoder();
   let buffer = '';
   let failureRecorded = false;
+  let receivedCompletion = false;
 
   const recordFailure = async () => {
     if (failureRecorded) return;
@@ -459,7 +464,9 @@ export function monitorCodexStreamFailure(stream, onStreamFailure) {
     try {
       const payload = JSON.parse(rawPayload);
       const type = payload.type || eventType;
-      if (type === 'response.failed' || type === 'error') {
+      if (type === 'response.completed') {
+        receivedCompletion = true;
+      } else if (type === 'response.failed' || type === 'error') {
         await recordFailure();
       }
     } catch (error) {
@@ -520,6 +527,11 @@ export function monitorCodexStreamFailure(stream, onStreamFailure) {
           if (done) {
             buffer += decoder.decode();
             await processBuffer(true);
+
+            if (!receivedCompletion) {
+              await recordFailure();
+            }
+
             controller.close();
             break;
           }
@@ -560,6 +572,7 @@ export async function convertCodexStreamToOpenAI(codexStream, originalModel, opt
       let emittedTextDelta = false;
       let hasToolCalls = false;
       let nextToolCallIndex = 0;
+      let receivedCompletion = false;
       const toolCallByItemId = new Map();
       const toolCallDeltaSent = new Set();
 
@@ -724,6 +737,7 @@ export async function convertCodexStreamToOpenAI(codexStream, originalModel, opt
           }
 
           if (type === 'response.completed') {
+            receivedCompletion = true;
             ensureRoleChunk();
             if (!emittedTextDelta) {
               const finalText = extractCodexOutputText(payload.response || {});
@@ -803,6 +817,19 @@ export async function convertCodexStreamToOpenAI(codexStream, originalModel, opt
           if (done) {
             buffer += decoder.decode();
             await processBuffer(true);
+
+            if (!receivedCompletion) {
+              await recordStreamFailure();
+              if (!emittedDone) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                  error: {
+                    message: 'Stream closed before response.completed',
+                    type: 'api_error'
+                  }
+                })}\n\n`));
+              }
+            }
+
             emitDone();
             controller.close();
             break;

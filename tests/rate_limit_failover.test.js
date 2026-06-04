@@ -161,3 +161,56 @@ test('Codex route avoids a source after its SSE stream fails', async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test('Codex route avoids a source after stream closes without completion', async () => {
+  const originalFetch = globalThis.fetch;
+  const upstreamRequests = [];
+
+  globalThis.fetch = async request => {
+    const url = new URL(request.url);
+    upstreamRequests.push(`${url.host}${url.pathname}`);
+
+    if (upstreamRequests.length === 1) {
+      return new Response([
+        'event: response.created',
+        'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.3-codex"}}',
+        '',
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"partial"}',
+        '',
+        ''
+      ].join('\n'), {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream; charset=utf-8' }
+      });
+    }
+
+    return new Response([
+      'event: response.completed',
+      'data: {"type":"response.completed","response":{"id":"resp_2","model":"gpt-5.3-codex","output_text":"ok"}}',
+      '',
+      ''
+    ].join('\n'), {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream; charset=utf-8' }
+    });
+  };
+
+  try {
+    const firstResponse = await worker.fetch(new Request('https://router.test/codex/v1/responses'));
+    assert.equal(firstResponse.status, 200);
+    const firstText = await firstResponse.text();
+    assert.match(firstText, /response\.created/);
+    assert.match(firstText, /partial/);
+    assert.doesNotMatch(firstText, /response\.completed/);
+
+    const secondResponse = await worker.fetch(new Request('https://router.test/codex/v1/responses'));
+    assert.equal(secondResponse.status, 200);
+    assert.match(await secondResponse.text(), /response\.completed/);
+
+    assert.equal(upstreamRequests.length, 2);
+    assert.notEqual(upstreamRequests[0], upstreamRequests[1]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
