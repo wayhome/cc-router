@@ -182,6 +182,8 @@ export async function tryCodexSources(request, manager, codexPath) {
           await manager.recordFailure(0, currentBaseUrlIndex, ROUTE_TYPES.CODEX);
           break;
         }
+
+        await new Promise(resolve => setTimeout(resolve, 1000 * (sourceAttempt + 1)));
       }
     } catch (error) {
       await manager.recordFailure(0, currentBaseUrlIndex, ROUTE_TYPES.CODEX);
