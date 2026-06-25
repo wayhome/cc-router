@@ -178,7 +178,15 @@ export async function tryCodexSources(request, manager, codexPath) {
         }
 
         lastResponse = response;
-        if (response.status !== 429 || sourceAttempt === CODEX_RATE_LIMIT_ATTEMPTS_PER_SOURCE - 1) {
+
+        // Log Codex errors for debugging
+        if (response.status >= 400) {
+          const errorText = await response.clone().text().catch(() => 'Unable to read error body');
+          console.error(`Codex error [${response.status}] from ${TARGET_BASE_URLS[currentBaseUrlIndex]}: ${errorText.substring(0, 500)}`);
+        }
+
+        // Retry on 429 (rate limit) and 503 (capacity/overload)
+        if ((response.status !== 429 && response.status !== 503) || sourceAttempt === CODEX_RATE_LIMIT_ATTEMPTS_PER_SOURCE - 1) {
           await manager.recordFailure(0, currentBaseUrlIndex, ROUTE_TYPES.CODEX);
           break;
         }
